@@ -1,0 +1,202 @@
+# CI/CD for SPMS Frontend — Next.js (standalone) on Google Cloud Run.
+#
+# Scope: dev only. Every push to `dev` runs lint/typecheck/test/build, then
+# builds & pushes a Docker image to Artifact Registry, then deploys it to
+# Cloud Run. qa/main are intentionally not wired up yet — add branch
+# pipelines for them the same way once their GCP projects/vars exist.
+#
+# Auth to GCP is Workload Identity Federation via the step's OIDC token — no
+# long-lived service account keys anywhere.
+#
+# NEXT_PUBLIC_API_BASE_URL and NEXT_PUBLIC_CHAT_API_BASE_URL are baked into
+# the browser bundle at `docker build` time (Next.js inlines NEXT_PUBLIC_*
+# at build, not at container start) — they're passed as --build-arg below,
+# not --set-env-vars at deploy. The Dockerfile itself fails the build if
+# either is empty (src/services/http.ts and src/proxy.ts both silently fall
+# back to '' otherwise, which builds fine but 500s on every request) — this
+# pipeline always supplies *some* value (real or placeholder, see below) so
+# that guard never trips here.
+#
+# GCP auth/registry variables (DEV_WORKLOAD_IDENTITY_PROVIDER_ID,
+# DEV_ENVIRONMENT_GCP_SERVICE_ACCOUNT, DEV_ENVIRONMENT_GCP_PROJECT_ID,
+# DEV_ENVIRONMENT_GCP_REGION, DEV_ENVIRONMENT_ARTIFACT_REGISTRY) are set at
+# the Bitbucket *workspace* level, so this repo already inherits the same
+# values the backend pipeline uses — nothing to add here for those.
+#
+# Frontend-specific repository variables (none of these exist yet — neither
+# backend has a Cloud Run URL until it's deployed at least once, so the
+# build-and-push step below falls back to RFC 2606 placeholder URLs when
+# these are unset, with a loud WARNING, purely to prove build+push+deploy
+# work end-to-end. Set these for real once each backend has a URL — no
+# pipeline change needed then, just add the variable and re-run):
+#   DEV_ENVIRONMENT_NEXT_PUBLIC_API_BASE_URL       — Backend A dev URL
+#   DEV_ENVIRONMENT_NEXT_PUBLIC_CHAT_API_BASE_URL  — Backend B dev URL
+#   DEV_ENVIRONMENT_INTERNAL_API_BASE_URL          — optional (falls back to
+#                                                     the public API URL)
+#   DEV_ENVIRONMENT_CLOUD_RUN_SERVICE_ACCOUNT      — optional runtime identity;
+#                                                     without it, Cloud Run
+#                                                     uses the project's
+#                                                     default compute SA
+
+image: google/cloud-sdk:latest
+
+options:
+  docker: true
+  size: 2x
+
+definitions:
+  caches:
+    npm: ~/.npm
+
+  steps:
+    - step: &lint_test_build
+        name: Lint, Typecheck, Test & Build
+        image: node:22-alpine
+        caches:
+          - npm
+        script:
+          - set -euo pipefail
+          - export HUSKY=0
+          - npm ci --include=optional
+          - echo "Linting..."
+          - npm run lint
+          - echo "Typechecking..."
+          - npm run typecheck
+          - echo "Running tests..."
+          - npm test
+          # Sanity build only — dummy values, unrelated to the real
+          # --build-arg values used in the Docker build step below.
+          - echo "Building (sanity check)..."
+          - export NEXT_PUBLIC_API_BASE_URL=http://localhost:3001
+          - export NEXT_PUBLIC_CHAT_API_BASE_URL=http://localhost:3002
+          - npm run build
+
+    - step: &build_and_push_image
+        name: Build & Push Docker Image
+        services:
+          - docker
+        oidc: true
+        script:
+          - &gcp_auth |
+            set -eo pipefail
+            echo "Authenticating to GCP via Workload Identity Federation..."
+            AUTH_DIR="$(mktemp -d)"
+            printf '%s' "$BITBUCKET_STEP_OIDC_TOKEN" > "${AUTH_DIR}/oidc-token.txt"
+            gcloud iam workload-identity-pools create-cred-config \
+              "${DEV_WORKLOAD_IDENTITY_PROVIDER_ID}" \
+              --service-account="${DEV_ENVIRONMENT_GCP_SERVICE_ACCOUNT}" \
+              --output-file="${AUTH_DIR}/credentials.json" \
+              --credential-source-file="${AUTH_DIR}/oidc-token.txt"
+            export GOOGLE_APPLICATION_CREDENTIALS="${AUTH_DIR}/credentials.json"
+            gcloud auth login --cred-file="${AUTH_DIR}/credentials.json"
+            gcloud config set project "${DEV_ENVIRONMENT_GCP_PROJECT_ID}"
+            gcloud auth list
+          - |
+            set -euo pipefail
+            echo "Validating build-arg variables..."
+
+            # BOOTSTRAP FALLBACKS — remove each once its real dev URL exists.
+            # The Dockerfile fails the build on an empty NEXT_PUBLIC_*, and
+            # neither backend is deployed yet on a first run, so there's no
+            # real URL to pass. RFC 2606 "always invalid" placeholders let the
+            # pipeline prove build+push+deploy work end-to-end; swap in the
+            # real Cloud Run URLs via these Bitbucket variables once each
+            # service exists — no pipeline change needed then.
+            export RESOLVED_NEXT_PUBLIC_API_BASE_URL="${DEV_ENVIRONMENT_NEXT_PUBLIC_API_BASE_URL:-https://placeholder-backend.dev.invalid}"
+            export RESOLVED_NEXT_PUBLIC_CHAT_API_BASE_URL="${DEV_ENVIRONMENT_NEXT_PUBLIC_CHAT_API_BASE_URL:-https://placeholder-chat.dev.invalid}"
+            if [ -z "${DEV_ENVIRONMENT_NEXT_PUBLIC_API_BASE_URL:-}" ]; then
+              echo "WARNING: DEV_ENVIRONMENT_NEXT_PUBLIC_API_BASE_URL not set — using placeholder ${RESOLVED_NEXT_PUBLIC_API_BASE_URL}."
+            fi
+            if [ -z "${DEV_ENVIRONMENT_NEXT_PUBLIC_CHAT_API_BASE_URL:-}" ]; then
+              echo "WARNING: DEV_ENVIRONMENT_NEXT_PUBLIC_CHAT_API_BASE_URL not set — using placeholder ${RESOLVED_NEXT_PUBLIC_CHAT_API_BASE_URL}."
+            fi
+
+            gcloud auth configure-docker "${DEV_ENVIRONMENT_GCP_REGION}-docker.pkg.dev" --quiet
+
+            TAG="$(date +%Y%m%d%H%M%S)-${BITBUCKET_BUILD_NUMBER}"
+            IMAGE_NAME="${BITBUCKET_REPO_SLUG}"
+            IMAGE_BASE="${DEV_ENVIRONMENT_GCP_REGION}-docker.pkg.dev/${DEV_ENVIRONMENT_GCP_PROJECT_ID}/${DEV_ENVIRONMENT_ARTIFACT_REGISTRY}/${IMAGE_NAME}"
+            echo "Image will be ${IMAGE_BASE}:${TAG}"
+
+            docker build --pull \
+              --label "org.opencontainers.image.revision=${BITBUCKET_COMMIT}" \
+              --label "org.opencontainers.image.version=${TAG}" \
+              --build-arg NEXT_PUBLIC_API_BASE_URL="${RESOLVED_NEXT_PUBLIC_API_BASE_URL}" \
+              --build-arg NEXT_PUBLIC_CHAT_API_BASE_URL="${RESOLVED_NEXT_PUBLIC_CHAT_API_BASE_URL}" \
+              --build-arg INTERNAL_API_BASE_URL="${DEV_ENVIRONMENT_INTERNAL_API_BASE_URL:-}" \
+              -t "${IMAGE_BASE}:${TAG}" \
+              -t "${IMAGE_BASE}:latest" \
+              .
+
+            echo "Pushing Docker image..."
+            docker push "${IMAGE_BASE}:${TAG}"
+            docker push "${IMAGE_BASE}:latest"
+
+            # The deploy step deploys this immutable tag, never :latest.
+            echo "IMAGE_URI=${IMAGE_BASE}:${TAG}" > build_info.txt
+            echo "Image pushed successfully."
+        artifacts:
+          - build_info.txt
+
+    - step: &deploy_cloud_run
+        name: Deploy to Cloud Run (dev)
+        oidc: true
+        script:
+          - *gcp_auth
+          - |
+            set -euo pipefail
+
+            IMAGE_URI="$(grep '^IMAGE_URI=' build_info.txt | cut -d'=' -f2-)"
+            if [[ -z "$IMAGE_URI" ]]; then
+              echo "IMAGE_URI missing from build_info.txt — did the build step run?"
+              exit 1
+            fi
+
+            gcloud artifacts docker images describe "${IMAGE_URI}"
+
+            SERVICE_NAME="${BITBUCKET_REPO_SLUG}"
+
+            DEPLOY_ARGS=""
+            if [ -n "${DEV_ENVIRONMENT_CLOUD_RUN_SERVICE_ACCOUNT:-}" ]; then
+              DEPLOY_ARGS="${DEPLOY_ARGS} --service-account=${DEV_ENVIRONMENT_CLOUD_RUN_SERVICE_ACCOUNT}"
+            fi
+
+            echo "Deploying ${IMAGE_URI} to ${SERVICE_NAME} (dev)..."
+
+            # --allow-unauthenticated: browsers hit this service directly.
+            # NEXT_PUBLIC_*/INTERNAL_API_BASE_URL are already baked into the
+            # image from the build step — no --set-env-vars needed for them.
+            # PORT is deliberately absent: Cloud Run reserves it and injects
+            # it from --port; the Next standalone server reads it at runtime.
+            gcloud run deploy "${SERVICE_NAME}" \
+              --image "${IMAGE_URI}" \
+              --region "${DEV_ENVIRONMENT_GCP_REGION}" \
+              --platform managed \
+              --allow-unauthenticated \
+              --port 8080 \
+              --cpu 1 \
+              --memory 512Mi \
+              --concurrency 80 \
+              --min-instances 0 \
+              --max-instances 10 \
+              --timeout 300 \
+              --labels "app=spms-frontend,env=dev,commit=${BITBUCKET_COMMIT}" \
+              ${DEPLOY_ARGS} \
+              --quiet
+
+            SERVICE_URL="$(gcloud run services describe "${SERVICE_NAME}" \
+              --region "${DEV_ENVIRONMENT_GCP_REGION}" \
+              --format='value(status.url)')"
+            echo "Deployed successfully! Service URL: ${SERVICE_URL}"
+
+            echo "Smoke checking ${SERVICE_URL} ..."
+            curl -fsS --retry 3 --retry-delay 5 \
+              -o /dev/null -w 'smoke check returned HTTP %{http_code}\n' \
+              "${SERVICE_URL}"
+
+pipelines:
+  branches:
+    dev:
+      - step: *lint_test_build
+      - step: *build_and_push_image
+      - step: *deploy_cloud_run

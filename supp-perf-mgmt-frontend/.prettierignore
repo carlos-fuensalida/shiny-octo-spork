@@ -1,0 +1,18 @@
+# Build output
+.next/
+out/
+build/
+dist/
+
+# Dependencies
+node_modules/
+
+# Generated / vendored
+next-env.d.ts
+package-lock.json
+coverage/
+
+# Markdown is hand-maintained (specs, CLAUDE.md, READMEs) — kept out of
+# Prettier so tables and prose aren't churned and .md edits aren't
+# format-gated (SPM-119).
+*.md

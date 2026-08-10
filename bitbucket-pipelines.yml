@@ -1,0 +1,188 @@
+image: google/cloud-sdk:latest
+
+options:
+  docker: true
+  size: 2x
+
+definitions:
+  steps:
+    - step: &get_env_variable
+        name: Get Environment Variables
+        script:
+          - echo "Getting Environment Variables..."
+          - |
+            if [[ "$BITBUCKET_BRANCH" == "dev" ]]; then
+              echo ENVIRONMENT_WORKLOAD_IDENTITY_PROVIDER_ID=$DEV_WORKLOAD_IDENTITY_PROVIDER_ID >> $BITBUCKET_PIPELINES_VARIABLES_PATH
+              echo ENVIRONMENT_GCP_SERVICE_ACCOUNT=$DEV_ENVIRONMENT_GCP_SERVICE_ACCOUNT >> $BITBUCKET_PIPELINES_VARIABLES_PATH
+              echo ENVIRONMENT_GCP_PROJECT_ID=$DEV_ENVIRONMENT_GCP_PROJECT_ID >> $BITBUCKET_PIPELINES_VARIABLES_PATH
+              echo ENVIRONMENT_GCP_REGION=$DEV_ENVIRONMENT_GCP_REGION >> $BITBUCKET_PIPELINES_VARIABLES_PATH
+              echo ENVIRONMENT_ARTIFACT_REGISTRY=$DEV_ENVIRONMENT_ARTIFACT_REGISTRY >> $BITBUCKET_PIPELINES_VARIABLES_PATH
+              echo ENVIRONMENT_PIPELINE_SERVICE_ACCOUNT=$DEV_ENVIRONMENT_PIPELINE_SERVICE_ACCOUNT >> $BITBUCKET_PIPELINES_VARIABLES_PATH
+              echo ENVIRONMENT=dev >> $BITBUCKET_PIPELINES_VARIABLES_PATH
+            elif [[ "$BITBUCKET_BRANCH" == "qa" ]]; then
+              echo ENVIRONMENT_WORKLOAD_IDENTITY_PROVIDER_ID=$QA_WORKLOAD_IDENTITY_PROVIDER_ID >> $BITBUCKET_PIPELINES_VARIABLES_PATH
+              echo ENVIRONMENT_GCP_SERVICE_ACCOUNT=$QA_ENVIRONMENT_GCP_SERVICE_ACCOUNT >> $BITBUCKET_PIPELINES_VARIABLES_PATH
+              echo ENVIRONMENT_GCP_PROJECT_ID=$QA_ENVIRONMENT_GCP_PROJECT_ID >> $BITBUCKET_PIPELINES_VARIABLES_PATH
+              echo ENVIRONMENT_GCP_REGION=$QA_ENVIRONMENT_GCP_REGION >> $BITBUCKET_PIPELINES_VARIABLES_PATH
+              echo ENVIRONMENT_ARTIFACT_REGISTRY=$QA_ENVIRONMENT_ARTIFACT_REGISTRY >> $BITBUCKET_PIPELINES_VARIABLES_PATH
+              echo ENVIRONMENT_PIPELINE_SERVICE_ACCOUNT=$QA_ENVIRONMENT_PIPELINE_SERVICE_ACCOUNT >> $BITBUCKET_PIPELINES_VARIABLES_PATH
+              echo ENVIRONMENT=qa >> $BITBUCKET_PIPELINES_VARIABLES_PATH
+            elif [[ "$BITBUCKET_BRANCH" == "main" ]]; then
+              echo ENVIRONMENT_WORKLOAD_IDENTITY_PROVIDER_ID=$PROD_WORKLOAD_IDENTITY_PROVIDER_ID >> $BITBUCKET_PIPELINES_VARIABLES_PATH
+              echo ENVIRONMENT_GCP_SERVICE_ACCOUNT=$PROD_ENVIRONMENT_GCP_SERVICE_ACCOUNT >> $BITBUCKET_PIPELINES_VARIABLES_PATH
+              echo ENVIRONMENT_GCP_PROJECT_ID=$PROD_ENVIRONMENT_GCP_PROJECT_ID >> $BITBUCKET_PIPELINES_VARIABLES_PATH
+              echo ENVIRONMENT_GCP_REGION=$PROD_ENVIRONMENT_GCP_REGION >> $BITBUCKET_PIPELINES_VARIABLES_PATH
+              echo ENVIRONMENT_ARTIFACT_REGISTRY=$PROD_ENVIRONMENT_ARTIFACT_REGISTRY >> $BITBUCKET_PIPELINES_VARIABLES_PATH
+              echo ENVIRONMENT_PIPELINE_SERVICE_ACCOUNT=$PROD_ENVIRONMENT_PIPELINE_SERVICE_ACCOUNT >> $BITBUCKET_PIPELINES_VARIABLES_PATH
+              echo ENVIRONMENT=prod >> $BITBUCKET_PIPELINES_VARIABLES_PATH
+            else
+              echo "Branch does not match any known environments. Exiting..."
+              exit 1
+            fi
+        output-variables:
+          - ENVIRONMENT
+          - ENVIRONMENT_WORKLOAD_IDENTITY_PROVIDER_ID
+          - ENVIRONMENT_GCP_SERVICE_ACCOUNT
+          - ENVIRONMENT_GCP_PROJECT_ID
+          - ENVIRONMENT_GCP_REGION
+          - ENVIRONMENT_ARTIFACT_REGISTRY
+          - ENVIRONMENT_PIPELINE_SERVICE_ACCOUNT
+
+
+    - step: &build_and_push_image
+        name: Build & Push Docker Image
+        services:
+          - docker
+        oidc: true
+        script:
+          - echo "Building and pushing Docker image to Artifact Registry..."
+          - set -euxo pipefail
+          - export TAG=$(date +%Y%m%d%H%M%S)-${BITBUCKET_BUILD_NUMBER}
+          # Image name within the Artifact Registry repo â€” override with the IMAGE_NAME variable.
+          - export IMAGE_NAME=${IMAGE_NAME:-${BITBUCKET_REPO_SLUG}}
+          - export REPO_NAME=${ENVIRONMENT_ARTIFACT_REGISTRY}
+          - export IMAGE_URI="${ENVIRONMENT_GCP_REGION}-docker.pkg.dev/${ENVIRONMENT_GCP_PROJECT_ID}/${REPO_NAME}/${IMAGE_NAME}"
+          - echo "Image URI will be ${IMAGE_URI}:${TAG}"
+
+          # Exchange the OIDC token for a Google Cloud access token and set it as an environment variable.
+          - echo "Authenticating to GCP..."
+          - echo $BITBUCKET_STEP_OIDC_TOKEN > ./oidc-token.txt
+          - gcloud iam workload-identity-pools create-cred-config ${ENVIRONMENT_WORKLOAD_IDENTITY_PROVIDER_ID} --service-account=${ENVIRONMENT_GCP_SERVICE_ACCOUNT} --output-file=credentials.json --credential-source-file=./oidc-token.txt
+
+          # Set up ADC
+          - export GOOGLE_APPLICATION_CREDENTIALS=`pwd`/credentials.json
+          - gcloud auth login --cred-file=`pwd`/credentials.json
+
+          # Verify authentication running gcloud commands
+          - gcloud config set project "${ENVIRONMENT_GCP_PROJECT_ID}"
+          - gcloud config list
+          - gcloud auth list
+          - gcloud auth configure-docker ${ENVIRONMENT_GCP_REGION}-docker.pkg.dev
+
+          # The Dockerfile builds on a Python 3.12 base image (FROM python:3.12-slim)
+          - echo "Building Docker image (Python 3.12 runtime)..."
+          - docker build -t ${IMAGE_URI}:${TAG} -t ${IMAGE_URI}:latest .
+
+          - echo "Pushing Docker image..."
+          - docker push ${IMAGE_URI}:${TAG}
+          - docker push ${IMAGE_URI}:latest
+
+          - echo "Image pushed successfully!"
+          - echo "IMAGE_URI=${IMAGE_URI}:${TAG}" >> build_info.txt
+          - echo "IMAGE_TAG=${TAG}" >> build_info.txt
+        artifacts:
+          - build_info.txt
+
+    - step: &deploy_cloud_run
+        name: Deploy to Cloud Run (Python 3.12)
+        oidc: true
+        script:
+          - echo "Deploying to Cloud Run from Artifact Registry..."
+          - set -euxo pipefail
+          - echo "Validating environment variables..."
+          - echo "ENVIRONMENT_GCP_PROJECT_ID=${ENVIRONMENT_GCP_PROJECT_ID}"
+          - echo "ENVIRONMENT_GCP_REGION=${ENVIRONMENT_GCP_REGION}"
+          - echo "ENVIRONMENT_ARTIFACT_REGISTRY=${ENVIRONMENT_ARTIFACT_REGISTRY}"
+          - echo "ENVIRONMENT_GCP_SERVICE_ACCOUNT=${ENVIRONMENT_GCP_SERVICE_ACCOUNT}"
+
+          # Exchange the OIDC token for a Google Cloud access token and set it as an environment variable.
+          - echo "Authenticating to GCP..."
+          - echo $BITBUCKET_STEP_OIDC_TOKEN > ./oidc-token.txt
+          - gcloud iam workload-identity-pools create-cred-config ${ENVIRONMENT_WORKLOAD_IDENTITY_PROVIDER_ID} --service-account=${ENVIRONMENT_GCP_SERVICE_ACCOUNT} --output-file=credentials.json --credential-source-file=./oidc-token.txt
+          - export GOOGLE_APPLICATION_CREDENTIALS=`pwd`/credentials.json
+          - gcloud auth login --cred-file=`pwd`/credentials.json
+          - gcloud config set project "${ENVIRONMENT_GCP_PROJECT_ID}"
+          - gcloud config list
+          - gcloud auth list
+
+          # Cloud Run service name â€” override per repo with the CLOUD_RUN_SERVICE_NAME variable.
+          - export SERVICE_NAME=${CLOUD_RUN_SERVICE_NAME:-${BITBUCKET_REPO_SLUG}}
+          - export IMAGE_NAME=${IMAGE_NAME:-${BITBUCKET_REPO_SLUG}}
+          - export REPO_NAME=${ENVIRONMENT_ARTIFACT_REGISTRY}
+          - export IMAGE_URI_BASE="${ENVIRONMENT_GCP_REGION}-docker.pkg.dev/${ENVIRONMENT_GCP_PROJECT_ID}/${REPO_NAME}/${IMAGE_NAME}"
+
+          # Resolve the exact Artifact Registry image produced by the build step.
+          - |
+            if [ -f build_info.txt ]; then
+              export IMAGE_URI=$(grep "^IMAGE_URI=" build_info.txt | cut -d'=' -f2-)
+              echo "Using image from build step: ${IMAGE_URI}"
+            else
+              export IMAGE_URI="${IMAGE_URI_BASE}:latest"
+              echo "No build_info.txt found, falling back to ${IMAGE_URI}"
+            fi
+
+          # Fail fast if the image is not actually in Artifact Registry.
+          - gcloud artifacts docker images describe "${IMAGE_URI}"
+
+          - echo "Deploying ${SERVICE_NAME} with image ${IMAGE_URI}"
+          - |
+            DEPLOY_ARGS=""
+
+            # Runtime identity of the Cloud Run service (least privilege, separate from the deployer SA).
+            if [ -n "${ENVIRONMENT_PIPELINE_SERVICE_ACCOUNT:-}" ]; then
+              DEPLOY_ARGS="${DEPLOY_ARGS} --service-account=${ENVIRONMENT_PIPELINE_SERVICE_ACCOUNT}"
+            fi
+
+            # Public by default for testing. Set CLOUD_RUN_ALLOW_UNAUTHENTICATED=false to make the service private.
+            if [ "${CLOUD_RUN_ALLOW_UNAUTHENTICATED:-true}" = "true" ]; then
+              DEPLOY_ARGS="${DEPLOY_ARGS} --allow-unauthenticated"
+            else
+              DEPLOY_ARGS="${DEPLOY_ARGS} --no-allow-unauthenticated"
+            fi
+
+            gcloud run deploy "${SERVICE_NAME}" \
+              --image "${IMAGE_URI}" \
+              --project "${ENVIRONMENT_GCP_PROJECT_ID}" \
+              --region "${ENVIRONMENT_GCP_REGION}" \
+              --platform managed \
+              --port "${CLOUD_RUN_PORT:-8080}" \
+              --cpu "${CLOUD_RUN_CPU:-1}" \
+              --memory "${CLOUD_RUN_MEMORY:-512Mi}" \
+              --min-instances "${CLOUD_RUN_MIN_INSTANCES:-0}" \
+              --max-instances "${CLOUD_RUN_MAX_INSTANCES:-10}" \
+              --concurrency 80 \
+              --timeout 300 \
+              --set-env-vars "ENVIRONMENT=${ENVIRONMENT}" \
+              --labels "environment=${ENVIRONMENT},runtime=python312,commit=${BITBUCKET_COMMIT}" \
+              --quiet \
+              ${DEPLOY_ARGS}
+
+          - export SERVICE_URL=$(gcloud run services describe "${SERVICE_NAME}" --region "${ENVIRONMENT_GCP_REGION}" --format='value(status.url)')
+          - 'echo "Deployed successfully! Service URL: ${SERVICE_URL}"'
+
+pipelines:
+  branches:
+    dev:
+      - step: *get_env_variable
+      - step: *build_and_push_image
+      - step: *deploy_cloud_run
+
+    qa:
+      - step: *get_env_variable
+      - step: *build_and_push_image
+      - step: *deploy_cloud_run
+
+    main:
+      - step: *get_env_variable
+      - step: *build_and_push_image
+      - step: *deploy_cloud_run

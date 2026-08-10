@@ -1,0 +1,222 @@
+# CI/CD for SPMS Data API (Backend A) — NestJS on Google Cloud Run.
+#
+# Scope: dev only. Every push to `dev` runs lint/test/build, then builds &
+# pushes a Docker image to Artifact Registry, then deploys it to Cloud Run.
+# qa/main are intentionally not wired up yet — add branch pipelines for them
+# the same way once their GCP projects/vars exist.
+#
+# Auth to GCP is Workload Identity Federation via the step's OIDC token — no
+# long-lived service account keys anywhere (CLAUDE.md → Stack).
+#
+# Bitbucket variables (dev):
+#   DEV_WORKLOAD_IDENTITY_PROVIDER_ID     — already set (workspace-level)
+#   DEV_ENVIRONMENT_GCP_SERVICE_ACCOUNT   — already set (workspace-level)
+#   DEV_ENVIRONMENT_GCP_PROJECT_ID        — already set (workspace-level)
+#   DEV_ENVIRONMENT_GCP_REGION            — already set (workspace-level)
+#   DEV_ENVIRONMENT_ARTIFACT_REGISTRY     — already set (workspace-level)
+#   DEV_ENVIRONMENT_FRONTEND_BASE_URL     — NEW. Joi-required at app boot
+#                                            (src/app.module.ts), but the
+#                                            frontend has no URL yet either on
+#                                            a first run — the deploy step
+#                                            below falls back to a placeholder
+#                                            when this is unset (with a loud
+#                                            WARNING) instead of failing the
+#                                            pipeline, purely so build+push+
+#                                            deploy can be proven end-to-end
+#                                            before real cross-service URLs
+#                                            exist. Set this for real once the
+#                                            frontend has a Cloud Run URL —
+#                                            CORS won't accept it until then.
+#
+# Optional (deploy step no-ops around these if unset):
+#   DEV_ENVIRONMENT_SESSION_COOKIE_DOMAIN     — cookie Domain attribute
+#   DEV_ENVIRONMENT_SESSION_JWT_SECRET_NAME   — Secret Manager secret name;
+#                                                 WITHOUT this, the app falls
+#                                                 back to the insecure
+#                                                 hardcoded dev secret
+#                                                 (src/modules/auth/auth.module.ts)
+#   DEV_ENVIRONMENT_CLOUD_RUN_SERVICE_ACCOUNT — runtime identity for the Cloud
+#                                                 Run revision; without it,
+#                                                 Cloud Run uses the project's
+#                                                 default compute service account
+#
+# Note on FRONTEND_ORIGIN: src/main.ts's CORS reads FRONTEND_ORIGIN, but the
+# Joi schema validates FRONTEND_BASE_URL — two different env vars for what's
+# meant to be the same frontend URL. This pipeline sets both from the single
+# DEV_ENVIRONMENT_FRONTEND_BASE_URL variable so CORS works regardless of which
+# name the code reads. Worth a follow-up ticket to unify the two in code.
+
+image: google/cloud-sdk:latest
+
+options:
+  docker: true
+  size: 2x
+
+definitions:
+  caches:
+    npm: ~/.npm
+
+  steps:
+    - step: &lint_test_build
+        name: Lint, Test & Build
+        image: node:22-alpine
+        caches:
+          - npm
+        script:
+          - set -euo pipefail
+          - npm ci
+          - echo "Linting..."
+          - npx eslint "{src,apps,libs,test}/**/*.ts"
+          # AppModule's Joi schema requires FRONTEND_BASE_URL at module init,
+          # which the unit/e2e suites trigger via createTestingModule/bootstrap.
+          - export FRONTEND_BASE_URL=http://localhost:3000
+          - echo "Running unit tests..."
+          - npm test
+          - echo "Running e2e tests..."
+          - npm run test:e2e
+          # Proves `nest build` succeeds before spending time on a Docker build.
+          - echo "Building..."
+          - npm run build
+
+    - step: &build_and_push_image
+        name: Build & Push Docker Image
+        services:
+          - docker
+        oidc: true
+        script:
+          - &gcp_auth |
+            set -eo pipefail
+            echo "Authenticating to GCP via Workload Identity Federation..."
+            AUTH_DIR="$(mktemp -d)"
+            printf '%s' "$BITBUCKET_STEP_OIDC_TOKEN" > "${AUTH_DIR}/oidc-token.txt"
+            gcloud iam workload-identity-pools create-cred-config \
+              "${DEV_WORKLOAD_IDENTITY_PROVIDER_ID}" \
+              --service-account="${DEV_ENVIRONMENT_GCP_SERVICE_ACCOUNT}" \
+              --output-file="${AUTH_DIR}/credentials.json" \
+              --credential-source-file="${AUTH_DIR}/oidc-token.txt"
+            export GOOGLE_APPLICATION_CREDENTIALS="${AUTH_DIR}/credentials.json"
+            gcloud auth login --cred-file="${AUTH_DIR}/credentials.json"
+            gcloud config set project "${DEV_ENVIRONMENT_GCP_PROJECT_ID}"
+            gcloud auth list
+          - |
+            set -euo pipefail
+            gcloud auth configure-docker "${DEV_ENVIRONMENT_GCP_REGION}-docker.pkg.dev" --quiet
+
+            TAG="$(date +%Y%m%d%H%M%S)-${BITBUCKET_BUILD_NUMBER}"
+            IMAGE_NAME="${BITBUCKET_REPO_SLUG}"
+            IMAGE_BASE="${DEV_ENVIRONMENT_GCP_REGION}-docker.pkg.dev/${DEV_ENVIRONMENT_GCP_PROJECT_ID}/${DEV_ENVIRONMENT_ARTIFACT_REGISTRY}/${IMAGE_NAME}"
+            echo "Image will be ${IMAGE_BASE}:${TAG}"
+
+            docker build --pull \
+              --label "org.opencontainers.image.revision=${BITBUCKET_COMMIT}" \
+              --label "org.opencontainers.image.version=${TAG}" \
+              -t "${IMAGE_BASE}:${TAG}" \
+              -t "${IMAGE_BASE}:latest" \
+              .
+
+            echo "Pushing Docker image..."
+            docker push "${IMAGE_BASE}:${TAG}"
+            docker push "${IMAGE_BASE}:latest"
+
+            # The deploy step deploys this immutable tag, never :latest.
+            echo "IMAGE_URI=${IMAGE_BASE}:${TAG}" > build_info.txt
+            echo "Image pushed successfully."
+        artifacts:
+          - build_info.txt
+
+    - step: &deploy_cloud_run
+        name: Deploy to Cloud Run (dev)
+        oidc: true
+        script:
+          - |
+            set -euo pipefail
+            echo "Validating deploy variables..."
+
+            # BOOTSTRAP FALLBACK — remove once the frontend has a real dev URL.
+            # FRONTEND_BASE_URL is Joi-required at boot (src/app.module.ts), but
+            # the frontend isn't deployed yet either, so there's no real value to
+            # pass on a first run. Falls back to an RFC 2606 "always invalid"
+            # placeholder so the app boots and the pipeline can prove build+push+
+            # deploy work end-to-end. CORS will not accept a real frontend origin
+            # until DEV_ENVIRONMENT_FRONTEND_BASE_URL is set to the frontend's
+            # actual Cloud Run URL — no pipeline change needed then, just add the
+            # Bitbucket variable and re-run.
+            export RESOLVED_FRONTEND_BASE_URL="${DEV_ENVIRONMENT_FRONTEND_BASE_URL:-https://placeholder-frontend.dev.invalid}"
+            if [ -z "${DEV_ENVIRONMENT_FRONTEND_BASE_URL:-}" ]; then
+              echo "WARNING: DEV_ENVIRONMENT_FRONTEND_BASE_URL not set — deploying with"
+              echo "placeholder ${RESOLVED_FRONTEND_BASE_URL}. CORS will reject the real"
+              echo "frontend until this variable is set to its actual Cloud Run URL."
+            fi
+
+            if [ -z "${DEV_ENVIRONMENT_SESSION_JWT_SECRET_NAME:-}" ]; then
+              echo "WARNING: DEV_ENVIRONMENT_SESSION_JWT_SECRET_NAME is not set."
+              echo "Deploying WITHOUT a real session secret — the app falls back to"
+              echo "the hardcoded insecure dev default. Fine for a first smoke test,"
+              echo "not fine to leave this way."
+            fi
+          - *gcp_auth
+          - |
+            set -euo pipefail
+
+            IMAGE_URI="$(grep '^IMAGE_URI=' build_info.txt | cut -d'=' -f2-)"
+            if [[ -z "$IMAGE_URI" ]]; then
+              echo "IMAGE_URI missing from build_info.txt — did the build step run?"
+              exit 1
+            fi
+
+            gcloud artifacts docker images describe "${IMAGE_URI}"
+
+            SERVICE_NAME="${BITBUCKET_REPO_SLUG}"
+
+            DEPLOY_ARGS=""
+            if [ -n "${DEV_ENVIRONMENT_CLOUD_RUN_SERVICE_ACCOUNT:-}" ]; then
+              DEPLOY_ARGS="${DEPLOY_ARGS} --service-account=${DEV_ENVIRONMENT_CLOUD_RUN_SERVICE_ACCOUNT}"
+            fi
+            if [ -n "${DEV_ENVIRONMENT_SESSION_JWT_SECRET_NAME:-}" ]; then
+              DEPLOY_ARGS="${DEPLOY_ARGS} --set-secrets=SESSION_JWT_SECRET=${DEV_ENVIRONMENT_SESSION_JWT_SECRET_NAME}:latest"
+            fi
+
+            echo "Deploying ${IMAGE_URI} to ${SERVICE_NAME} (dev)..."
+
+            # --allow-unauthenticated: the browser calls this API directly with
+            # the session cookie (API_SPEC.md §Authentication) and cannot present
+            # a Google IAM token — authorization is the session cookie itself,
+            # enforced in-app. PORT is deliberately absent from --set-env-vars:
+            # Cloud Run reserves it and injects it from --port; src/main.ts reads
+            # it at runtime. ^@^ picks @ as the delimiter so values may safely
+            # contain commas (e.g. a comma in a cookie domain list).
+            gcloud run deploy "${SERVICE_NAME}" \
+              --image "${IMAGE_URI}" \
+              --region "${DEV_ENVIRONMENT_GCP_REGION}" \
+              --platform managed \
+              --allow-unauthenticated \
+              --port 8080 \
+              --cpu 1 \
+              --memory 512Mi \
+              --concurrency 80 \
+              --min-instances 0 \
+              --max-instances 10 \
+              --timeout 300 \
+              --labels "app=spms-backend-a,env=dev,commit=${BITBUCKET_COMMIT}" \
+              --set-env-vars "^@^NODE_ENV=production@FRONTEND_BASE_URL=${RESOLVED_FRONTEND_BASE_URL}@FRONTEND_ORIGIN=${RESOLVED_FRONTEND_BASE_URL}@SESSION_COOKIE_DOMAIN=${DEV_ENVIRONMENT_SESSION_COOKIE_DOMAIN:-}" \
+              ${DEPLOY_ARGS} \
+              --quiet
+
+            SERVICE_URL="$(gcloud run services describe "${SERVICE_NAME}" \
+              --region "${DEV_ENVIRONMENT_GCP_REGION}" \
+              --format='value(status.url)')"
+            echo "Deployed successfully! Service URL: ${SERVICE_URL}"
+
+            # Routes live under the /api/v1 global prefix (src/main.ts
+            # setGlobalPrefix), so bare / would 404.
+            echo "Smoke checking ${SERVICE_URL}/api/v1 ..."
+            curl -fsS --retry 3 --retry-delay 5 \
+              -o /dev/null -w 'smoke check returned HTTP %{http_code}\n' \
+              "${SERVICE_URL}/api/v1"
+
+pipelines:
+  branches:
+    dev:
+      - step: *lint_test_build
+      - step: *build_and_push_image
+      - step: *deploy_cloud_run
