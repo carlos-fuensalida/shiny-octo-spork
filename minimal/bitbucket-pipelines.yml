@@ -1,0 +1,185 @@
+# CI/CD for the minimal hello-world app — plain Node.js on Google Cloud Run.
+#
+# Purpose: this is a throwaway test rig, not a product service. It exists to
+# prove the Docker build + Cloud Run deploy plumbing works end-to-end, in
+# isolation from the frontend/backend apps' own complexity (no Next.js build
+# step, no NestJS/TypeScript compile, no app-specific env vars). If this
+# pipeline goes green, the pattern it proves out is the same one the
+# frontend/backend pipelines already use — the intent is to feed lessons
+# from getting THIS green back into the frontend's own pipeline, not just to
+# prove this one repo works.
+#
+# Lives in its OWN dedicated Bitbucket repo (not a subfolder of an existing
+# one) — Bitbucket only reads bitbucket-pipelines.yml at a repo's root, so
+# this file and everything else under minimal/ needs to be pushed there as
+# that new repo's root contents, same as the frontend/backend repos each
+# have their own root.
+#
+# Adapted from supp-perf-mgmt-frontend/bitbucket-pipelines.yml: same GCP auth
+# (Workload Identity Federation via the step's OIDC token, no long-lived
+# service account keys), same IMAGE_NAME/SERVICE_NAME derived from
+# BITBUCKET_REPO_SLUG (this repo's own slug — no collision with the other
+# two since it's a separate Bitbucket repo), and the same
+# lint/test -> build & push -> deploy shape, minus the separate "build the
+# app before Docker" step — there's no build here, `npm ci` alone is enough
+# before `docker build` packages it.
+#
+# BEFORE FIRST RUN — two things to check on the GCP/Bitbucket side that
+# aren't fixable from this YAML:
+#   1. Bitbucket *workspace*-level variables (DEV_WORKLOAD_IDENTITY_PROVIDER_ID,
+#      DEV_ENVIRONMENT_GCP_SERVICE_ACCOUNT, DEV_ENVIRONMENT_GCP_PROJECT_ID,
+#      DEV_ENVIRONMENT_GCP_REGION, DEV_ENVIRONMENT_ARTIFACT_REGISTRY) only
+#      reach this new repo automatically if it's created in the SAME
+#      Bitbucket workspace as the frontend/backend repos.
+#   2. The GCP Workload Identity Federation provider's trust (the IAM
+#      binding / attribute condition on DEV_ENVIRONMENT_GCP_SERVICE_ACCOUNT)
+#      may be scoped to the frontend/backend repos' specific UUIDs rather
+#      than the whole workspace — if so, this new repo's OIDC token will be
+#      rejected until its UUID (or the workspace UUID, if widening to that
+#      instead) is added to that binding. Check this in GCP IAM before
+#      assuming a first failure is a bug in this file.
+#
+# Wired up for dev plus minimal-code-for-pipeline-test — this branch is this
+# test's own proving ground, same temporary role SPM-53/SPM-54 played for
+# the frontend/backend pipelines (test on this branch before it's ever
+# expected to touch dev). Both branches deploy to the SAME dev Cloud Run
+# service (name comes from BITBUCKET_REPO_SLUG, not the branch), so a push
+# to either overwrites whatever the other last deployed — fine while this
+# is the only branch in play, remove this entry once merged to dev.
+
+image: google/cloud-sdk:latest
+
+options:
+  docker: true
+
+definitions:
+  caches:
+    npm: ~/.npm
+
+  steps:
+    - step: &test
+        name: Test
+        image: node:22-alpine
+        caches:
+          - npm
+        script:
+          - set -euo pipefail
+          - npm ci
+          - echo "Running tests..."
+          - npm test
+
+    - step: &build_and_push_image
+        name: Build & Push Docker Image
+        services:
+          - docker
+        oidc: true
+        script:
+          - &gcp_auth |
+            set -eo pipefail
+            echo "Authenticating to GCP via Workload Identity Federation..."
+            AUTH_DIR="$(mktemp -d)"
+            printf '%s' "$BITBUCKET_STEP_OIDC_TOKEN" > "${AUTH_DIR}/oidc-token.txt"
+            gcloud iam workload-identity-pools create-cred-config \
+              "${DEV_WORKLOAD_IDENTITY_PROVIDER_ID}" \
+              --service-account="${DEV_ENVIRONMENT_GCP_SERVICE_ACCOUNT}" \
+              --output-file="${AUTH_DIR}/credentials.json" \
+              --credential-source-file="${AUTH_DIR}/oidc-token.txt"
+            export GOOGLE_APPLICATION_CREDENTIALS="${AUTH_DIR}/credentials.json"
+            gcloud auth login --cred-file="${AUTH_DIR}/credentials.json"
+            gcloud config set project "${DEV_ENVIRONMENT_GCP_PROJECT_ID}"
+            gcloud auth list
+          - |
+            set -euo pipefail
+            gcloud auth configure-docker "${DEV_ENVIRONMENT_GCP_REGION}-docker.pkg.dev" --quiet
+
+            TAG="$(date +%Y%m%d%H%M%S)-${BITBUCKET_BUILD_NUMBER}"
+            IMAGE_NAME="${BITBUCKET_REPO_SLUG}"
+            IMAGE_BASE="${DEV_ENVIRONMENT_GCP_REGION}-docker.pkg.dev/${DEV_ENVIRONMENT_GCP_PROJECT_ID}/${DEV_ENVIRONMENT_ARTIFACT_REGISTRY}/${IMAGE_NAME}"
+            echo "Image will be ${IMAGE_BASE}:${TAG}"
+
+            docker build --pull \
+              --label "org.opencontainers.image.revision=${BITBUCKET_COMMIT}" \
+              --label "org.opencontainers.image.version=${TAG}" \
+              -t "${IMAGE_BASE}:${TAG}" \
+              -t "${IMAGE_BASE}:latest" \
+              .
+
+            echo "Pushing Docker image..."
+            docker push "${IMAGE_BASE}:${TAG}"
+            docker push "${IMAGE_BASE}:latest"
+
+            # The deploy step deploys this immutable tag, never :latest.
+            echo "IMAGE_URI=${IMAGE_BASE}:${TAG}" > build_info.txt
+            echo "Image pushed successfully."
+        artifacts:
+          - build_info.txt
+
+    - step: &deploy_cloud_run
+        name: Deploy to Cloud Run (dev)
+        oidc: true
+        script:
+          - *gcp_auth
+          - |
+            set -euo pipefail
+
+            IMAGE_URI="$(grep '^IMAGE_URI=' build_info.txt | cut -d'=' -f2-)"
+            if [[ -z "$IMAGE_URI" ]]; then
+              echo "IMAGE_URI missing from build_info.txt — did the build step run?"
+              exit 1
+            fi
+
+            gcloud artifacts docker images describe "${IMAGE_URI}"
+
+            SERVICE_NAME="${BITBUCKET_REPO_SLUG}"
+
+            echo "Deploying ${IMAGE_URI} to ${SERVICE_NAME} (dev)..."
+
+            # --allow-unauthenticated: this is a smoke-testable hello-world,
+            # meant to be curl-able directly. Deliberately tiny resource
+            # footprint (256Mi/1 CPU, max 2 instances) — there's no real
+            # traffic to size for. PORT is deliberately absent from
+            # --set-env-vars: Cloud Run reserves it and injects it from
+            # --port; server.js reads it at runtime.
+            gcloud run deploy "${SERVICE_NAME}" \
+              --image "${IMAGE_URI}" \
+              --region "${DEV_ENVIRONMENT_GCP_REGION}" \
+              --platform managed \
+              --allow-unauthenticated \
+              --port 8080 \
+              --cpu 1 \
+              --memory 256Mi \
+              --concurrency 80 \
+              --min-instances 0 \
+              --max-instances 2 \
+              --timeout 60 \
+              --labels "app=minimal-hello-world,env=dev,commit=${BITBUCKET_COMMIT}" \
+              --quiet
+
+            SERVICE_URL="$(gcloud run services describe "${SERVICE_NAME}" \
+              --region "${DEV_ENVIRONMENT_GCP_REGION}" \
+              --format='value(status.url)')"
+            echo "Deployed successfully! Service URL: ${SERVICE_URL}"
+
+            # No -f here (deliberately, same reasoning as the frontend/backend
+            # pipelines): --allow-unauthenticated asks Cloud Run to bind
+            # allUsers as roles/run.invoker, but the deploying service account
+            # currently lacks permission to set that IAM policy on this
+            # project (same known gap already tracked for the other two
+            # services — see docs/cloud-run-architecture-issues.md) — so this
+            # may report 403 until that's fixed, and that's not this
+            # pipeline's problem to gate on.
+            echo "Smoke checking ${SERVICE_URL} ..."
+            curl -sS --retry 3 --retry-delay 5 \
+              -o /dev/null -w 'smoke check returned HTTP %{http_code}\n' \
+              "${SERVICE_URL}"
+
+pipelines:
+  branches:
+    dev:
+      - step: *test
+      - step: *build_and_push_image
+      - step: *deploy_cloud_run
+    minimal-code-for-pipeline-test:
+      - step: *test
+      - step: *build_and_push_image
+      - step: *deploy_cloud_run

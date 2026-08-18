@@ -1,0 +1,11 @@
+{
+  "name": "minimal-hello-world",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Minimal Node.js hello-world app used to prove out the Docker + Cloud Run pipeline in isolation, independent of the frontend/backend apps.",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js",
+    "test": "node --test"
+  }
+}

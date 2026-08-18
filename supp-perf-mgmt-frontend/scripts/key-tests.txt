@@ -1,9 +1,0 @@
-# One test file path per line, relative to repo root.
-# Lines starting with # are comments.
-
-src/test/services/http.test.ts
-src/test/services/auth.service.test.ts
-src/test/services/kpi.service.test.ts
-src/test/components/ui/KpiCard.test.tsx
-src/test/components/ui/SectionCard.test.tsx
-src/test/components/summary/QualityPerformanceSection.test.tsx
