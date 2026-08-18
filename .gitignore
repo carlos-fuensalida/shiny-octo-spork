@@ -1,0 +1,15 @@
+# The real project repos are cloned in as siblings for cross-repo work, but are
+# NOT tracked here — they are independent Bitbucket repositories with their own
+# remotes, branches, and pipelines. See CLAUDE.md → Workspace layout.
+/supp-perf-mgmt-frontend/
+/supp-perf-mgmt-backend/
+/supp-perf-mgmt-ai/
+
+# Node
+node_modules/
+npm-debug.log*
+
+# Local env / editor
+.env
+.env.local
+.DS_Store
