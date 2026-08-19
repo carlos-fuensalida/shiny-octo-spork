@@ -1,0 +1,281 @@
+# CI/CD for SPMS Frontend — Next.js (standalone) on Google Cloud Run.
+#
+# Scope: dev, plus feature/SPM-53-pipeline-frontend (this ticket's own
+# branch, wired up temporarily so the pipeline can be tested before merging —
+# remove once merged to dev). Every push to either runs lint/typecheck/test,
+# then builds the Next.js app directly (no Docker), then packages that
+# build into a Docker image and pushes it to Artifact Registry, then deploys
+# it to Cloud Run. Both branches deploy to the SAME dev Cloud Run service
+# (name is derived from BITBUCKET_REPO_SLUG, not the branch) — that's
+# intentional while this branch is the pipeline's proving ground, but means a
+# push to either branch overwrites whatever the other last deployed.
+# qa/main are intentionally not wired up yet — add branch pipelines for them
+# the same way once their GCP projects/vars exist.
+#
+# Auth to GCP is Workload Identity Federation via the step's OIDC token — no
+# long-lived service account keys anywhere.
+#
+# WHY THE BUILD HAPPENS OUTSIDE DOCKER (added 2026-08-11): `next build` used
+# to run inside the "Build & Push Docker Image" step's `docker build`, via
+# the Docker-in-Docker sidecar (`services: [docker]`). That nested-build
+# context is a known trap for Next.js's Turbopack — it tends to over-detect
+# available CPU and thrash instead of just running slower — and it did here:
+# the identical `npm run build` that takes seconds in the plain
+# node:22-alpine step below took over two hours inside `docker build` and
+# got killed by Bitbucket's 120-minute step limit. Fix: build once in "Build
+# Next.js App" (plain container, no Docker-in-Docker), pass the build output
+# to the next step as pipeline artifacts, and have the Docker step only
+# package it — see the Dockerfile's own header comment for the runner side
+# of this.
+#
+# NEXT_PUBLIC_API_BASE_URL and NEXT_PUBLIC_CHAT_API_BASE_URL are baked into
+# the browser bundle at `next build` time (Next.js inlines NEXT_PUBLIC_* at
+# build, not at container start), which is why they're resolved and consumed
+# in the "Build Next.js App" step, not later. The Dockerfile no longer even
+# accepts them as build-args — by the time `docker build` runs, they're
+# already compiled into `.next/standalone`.
+#
+# GCP auth/registry variables (DEV_WORKLOAD_IDENTITY_PROVIDER_ID,
+# DEV_ENVIRONMENT_GCP_SERVICE_ACCOUNT, DEV_ENVIRONMENT_GCP_PROJECT_ID,
+# DEV_ENVIRONMENT_GCP_REGION, DEV_ENVIRONMENT_ARTIFACT_REGISTRY) are set at
+# the Bitbucket *workspace* level, so this repo already inherits the same
+# values the backend pipeline uses — nothing to add here for those.
+#
+# Frontend-specific repository variables (none of these exist yet as real
+# Bitbucket variables — set them for real once you're ready to stop relying
+# on the fallback below; no pipeline change needed then, just add the
+# variable and re-run):
+#   DEV_ENVIRONMENT_NEXT_PUBLIC_API_BASE_URL       — Backend A dev URL
+#   DEV_ENVIRONMENT_NEXT_PUBLIC_CHAT_API_BASE_URL  — Backend B dev URL
+#   DEV_ENVIRONMENT_INTERNAL_API_BASE_URL          — optional (falls back to
+#                                                     the resolved public API
+#                                                     URL below, not empty)
+#   DEV_ENVIRONMENT_CLOUD_RUN_SERVICE_ACCOUNT      — optional runtime identity;
+#                                                     without it, Cloud Run
+#                                                     uses the project's
+#                                                     default compute SA
+#
+# DEV_ENVIRONMENT_NEXT_PUBLIC_API_BASE_URL's fallback below is hardcoded to
+# Backend A's real dev Cloud Run URL (confirmed 2026-08-11:
+# https://supp-perf-mgmt-backend-508857463128.us-east4.run.app) rather than an
+# RFC 2606 placeholder, per this test iteration's "hardcode anything not in
+# the Bitbucket variables yet" approach — swap it for the real Bitbucket
+# variable once that's set up. Note this still 403s on every real request
+# until the Cloud Run IAM gap tracked in the draft "[BE] Fix IAM permissions
+# so Cloud Run dev deploy can bind allUsers as invoker" ticket is fixed — the
+# frontend will build/deploy fine, it just can't reach a live backend yet.
+# NEXT_PUBLIC_CHAT_API_BASE_URL is left on the RFC 2606 placeholder pending
+# confirmation of which deployed service is actually Backend B (Chat
+# Service) — see conversation, not yet wired to a real URL.
+
+image: google/cloud-sdk:latest
+
+options:
+  docker: true
+  size: 2x
+
+definitions:
+  caches:
+    npm: ~/.npm
+
+  steps:
+    - step: &lint_typecheck_test
+        name: Lint, Typecheck & Test
+        image: node:22-alpine
+        caches:
+          - npm
+        script:
+          - set -euo pipefail
+          - export HUSKY=0
+          - npm ci --include=optional
+          - echo "Linting..."
+          - npm run lint
+          - echo "Typechecking..."
+          - npm run typecheck
+          - echo "Running tests..."
+          - npm test
+
+    - step: &build_app
+        name: Build Next.js App
+        image: node:22-alpine
+        caches:
+          - npm
+        script:
+          - set -euo pipefail
+          - export HUSKY=0
+          - npm ci --include=optional
+          - echo "Resolving build-time API URLs..."
+          - |
+            set -euo pipefail
+
+            # BOOTSTRAP FALLBACKS — remove each once its real dev URL exists.
+            # The Dockerfile's predecessor (`next build` itself) fails on an
+            # empty NEXT_PUBLIC_*, and neither backend is deployed yet on a
+            # first run, so there's no real URL to pass. RFC 2606 "always
+            # invalid" placeholders let the pipeline prove build+push+deploy
+            # work end-to-end; swap in the real Cloud Run URLs via these
+            # Bitbucket variables once each service exists — no pipeline
+            # change needed then.
+            # Hardcoded fallback (not an RFC 2606 placeholder) — Backend A's
+            # real dev Cloud Run URL, until DEV_ENVIRONMENT_NEXT_PUBLIC_API_BASE_URL
+            # exists as a real Bitbucket variable. Still 403s until the Cloud
+            # Run IAM gap (tracked separately) is fixed — see header comment.
+            export RESOLVED_NEXT_PUBLIC_API_BASE_URL="${DEV_ENVIRONMENT_NEXT_PUBLIC_API_BASE_URL:-https://supp-perf-mgmt-backend-508857463128.us-east4.run.app}"
+            export RESOLVED_NEXT_PUBLIC_CHAT_API_BASE_URL="${DEV_ENVIRONMENT_NEXT_PUBLIC_CHAT_API_BASE_URL:-https://placeholder-chat.dev.invalid}"
+            export RESOLVED_INTERNAL_API_BASE_URL="${DEV_ENVIRONMENT_INTERNAL_API_BASE_URL:-$RESOLVED_NEXT_PUBLIC_API_BASE_URL}"
+            if [ -z "${DEV_ENVIRONMENT_NEXT_PUBLIC_API_BASE_URL:-}" ]; then
+              echo "WARNING: DEV_ENVIRONMENT_NEXT_PUBLIC_API_BASE_URL not set — using hardcoded dev backend URL ${RESOLVED_NEXT_PUBLIC_API_BASE_URL}."
+            fi
+            if [ -z "${DEV_ENVIRONMENT_NEXT_PUBLIC_CHAT_API_BASE_URL:-}" ]; then
+              echo "WARNING: DEV_ENVIRONMENT_NEXT_PUBLIC_CHAT_API_BASE_URL not set — using placeholder ${RESOLVED_NEXT_PUBLIC_CHAT_API_BASE_URL}."
+            fi
+
+            # Handed to the "Build & Push Docker Image" step as a pipeline
+            # artifact — steps run in separate containers, so env vars set
+            # here don't otherwise survive to the next step.
+            echo "RESOLVED_INTERNAL_API_BASE_URL=${RESOLVED_INTERNAL_API_BASE_URL}" > frontend_build_env.txt
+
+            export NEXT_PUBLIC_API_BASE_URL="${RESOLVED_NEXT_PUBLIC_API_BASE_URL}"
+            export NEXT_PUBLIC_CHAT_API_BASE_URL="${RESOLVED_NEXT_PUBLIC_CHAT_API_BASE_URL}"
+            echo "Building..."
+            npm run build
+        artifacts:
+          - .next/standalone/**
+          - .next/static/**
+          - frontend_build_env.txt
+
+    - step: &build_and_push_image
+        name: Build & Push Docker Image
+        services:
+          - docker
+        oidc: true
+        script:
+          - &gcp_auth |
+            set -eo pipefail
+            echo "Authenticating to GCP via Workload Identity Federation..."
+            AUTH_DIR="$(mktemp -d)"
+            printf '%s' "$BITBUCKET_STEP_OIDC_TOKEN" > "${AUTH_DIR}/oidc-token.txt"
+            gcloud iam workload-identity-pools create-cred-config \
+              "${DEV_WORKLOAD_IDENTITY_PROVIDER_ID}" \
+              --service-account="${DEV_ENVIRONMENT_GCP_SERVICE_ACCOUNT}" \
+              --output-file="${AUTH_DIR}/credentials.json" \
+              --credential-source-file="${AUTH_DIR}/oidc-token.txt"
+            export GOOGLE_APPLICATION_CREDENTIALS="${AUTH_DIR}/credentials.json"
+            gcloud auth login --cred-file="${AUTH_DIR}/credentials.json"
+            gcloud config set project "${DEV_ENVIRONMENT_GCP_PROJECT_ID}"
+            gcloud auth list
+          - |
+            set -euo pipefail
+            echo "Loading resolved build-time vars from the Build Next.js App step..."
+            source frontend_build_env.txt
+
+            gcloud auth configure-docker "${DEV_ENVIRONMENT_GCP_REGION}-docker.pkg.dev" --quiet
+
+            TAG="$(date +%Y%m%d%H%M%S)-${BITBUCKET_BUILD_NUMBER}"
+            IMAGE_NAME="${BITBUCKET_REPO_SLUG}"
+            IMAGE_BASE="${DEV_ENVIRONMENT_GCP_REGION}-docker.pkg.dev/${DEV_ENVIRONMENT_GCP_PROJECT_ID}/${DEV_ENVIRONMENT_ARTIFACT_REGISTRY}/${IMAGE_NAME}"
+            echo "Image will be ${IMAGE_BASE}:${TAG}"
+
+            # .next/standalone and .next/static are restored from the "Build
+            # Next.js App" step's artifacts (already in this checkout) — this
+            # step never runs `next build` itself, see the Dockerfile header.
+            docker build --pull \
+              --label "org.opencontainers.image.revision=${BITBUCKET_COMMIT}" \
+              --label "org.opencontainers.image.version=${TAG}" \
+              --build-arg INTERNAL_API_BASE_URL="${RESOLVED_INTERNAL_API_BASE_URL}" \
+              -t "${IMAGE_BASE}:${TAG}" \
+              -t "${IMAGE_BASE}:latest" \
+              .
+
+            echo "Pushing Docker image..."
+            docker push "${IMAGE_BASE}:${TAG}"
+            docker push "${IMAGE_BASE}:latest"
+
+            # The deploy step deploys this immutable tag, never :latest.
+            echo "IMAGE_URI=${IMAGE_BASE}:${TAG}" > build_info.txt
+            echo "Image pushed successfully."
+        artifacts:
+          - build_info.txt
+
+    - step: &deploy_cloud_run
+        name: Deploy to Cloud Run (dev)
+        oidc: true
+        script:
+          - *gcp_auth
+          - |
+            set -euo pipefail
+
+            IMAGE_URI="$(grep '^IMAGE_URI=' build_info.txt | cut -d'=' -f2-)"
+            if [[ -z "$IMAGE_URI" ]]; then
+              echo "IMAGE_URI missing from build_info.txt — did the build step run?"
+              exit 1
+            fi
+
+            gcloud artifacts docker images describe "${IMAGE_URI}"
+
+            SERVICE_NAME="${BITBUCKET_REPO_SLUG}"
+
+            DEPLOY_ARGS=""
+            if [ -n "${DEV_ENVIRONMENT_CLOUD_RUN_SERVICE_ACCOUNT:-}" ]; then
+              DEPLOY_ARGS="${DEPLOY_ARGS} --service-account=${DEV_ENVIRONMENT_CLOUD_RUN_SERVICE_ACCOUNT}"
+            fi
+
+            echo "Deploying ${IMAGE_URI} to ${SERVICE_NAME} (dev)..."
+
+            # --allow-unauthenticated: browsers hit this service directly.
+            # NEXT_PUBLIC_* are already baked into the image from the "Build
+            # Next.js App" step; INTERNAL_API_BASE_URL from the Docker build
+            # step — no --set-env-vars needed for any of them here. PORT is
+            # deliberately absent: Cloud Run reserves it and injects it from
+            # --port; the Next standalone server reads it at runtime.
+            gcloud run deploy "${SERVICE_NAME}" \
+              --image "${IMAGE_URI}" \
+              --region "${DEV_ENVIRONMENT_GCP_REGION}" \
+              --platform managed \
+              --allow-unauthenticated \
+              --port 8080 \
+              --cpu 1 \
+              --memory 512Mi \
+              --concurrency 80 \
+              --min-instances 0 \
+              --max-instances 10 \
+              --timeout 300 \
+              --labels "app=spms-frontend,env=dev,commit=${BITBUCKET_COMMIT}" \
+              ${DEPLOY_ARGS} \
+              --quiet
+
+            SERVICE_URL="$(gcloud run services describe "${SERVICE_NAME}" \
+              --region "${DEV_ENVIRONMENT_GCP_REGION}" \
+              --format='value(status.url)')"
+            echo "Deployed successfully! Service URL: ${SERVICE_URL}"
+
+            # No -f here (deliberately): this only logs the status code, it
+            # does not gate the pipeline on it. --allow-unauthenticated above
+            # asks Cloud Run to bind allUsers as roles/run.invoker, but the
+            # deploying service account currently lacks permission to set that
+            # IAM policy (gcloud prints "Setting IAM policy failed" a few
+            # lines up, non-fatal to the deploy itself) — same gap already
+            # confirmed on the backend's dev deploy (same project/SA), tracked
+            # in the draft Jira ticket "[BE] Fix IAM permissions so Cloud Run
+            # dev deploy can bind allUsers as invoker". So this check will
+            # report 403 until that's fixed. -f would turn that known, tracked
+            # gap into a red pipeline step for no actionable reason. Once the
+            # IAM binding is fixed, a non-200 here again means something newly
+            # wrong and worth re-adding -f for.
+            echo "Smoke checking ${SERVICE_URL} ..."
+            curl -sS --retry 3 --retry-delay 5 \
+              -o /dev/null -w 'smoke check returned HTTP %{http_code}\n' \
+              "${SERVICE_URL}"
+
+pipelines:
+  branches:
+    dev:
+      - step: *lint_typecheck_test
+      - step: *build_app
+      - step: *build_and_push_image
+      - step: *deploy_cloud_run
+    feature/SPM-53-pipeline-frontend:
+      - step: *lint_typecheck_test
+      - step: *build_app
+      - step: *build_and_push_image
+      - step: *deploy_cloud_run
