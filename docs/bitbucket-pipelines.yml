@@ -1,61 +1,125 @@
-# CI/CD for SPMS Data API (Backend A) — NestJS on Google Cloud Run.
+# CI/CD for SPMS Frontend — Next.js (standalone) on Google Cloud Run.
 #
-# Scope: dev, plus feature/SPM-54-pipeline-backend (this ticket's own branch,
-# wired up temporarily so the pipeline can be tested before merging — remove
-# once merged to dev). Every push to either runs lint/test/build, then builds
-# & pushes a Docker image to Artifact Registry, then deploys it to Cloud Run.
-# Both branches deploy to the SAME dev Cloud Run service (name is derived from
-# BITBUCKET_REPO_SLUG, not the branch) — that's intentional while this branch
-# is the pipeline's proving ground, but means a push to either branch
-# overwrites whatever the other last deployed.
-# qa/main are intentionally not wired up yet — add branch pipelines for them
-# the same way once their GCP projects/vars exist.
+# Scope: three triggers.
+#   - Any pull request runs lint/typecheck/test only (no Docker, no GCP, no
+#     deploy) as a pre-merge gate on the feature branch itself.
+#   - A push that lands on dev, qa, or main runs the full sequence: resolve
+#     that branch's environment variables, lint/typecheck/test, build the
+#     Next.js app directly (no Docker), package that build into a Docker
+#     image and push it to Artifact Registry, then deploy it to Cloud Run
+#     (service name derived from BITBUCKET_REPO_SLUG). Feature branches are
+#     merged into dev — never pushed to it directly (CLAUDE.md → Branching)
+#     — and that merge is what triggers the dev deploy; qa and main deploy
+#     the same way once code is promoted onto those branches.
 #
 # Auth to GCP is Workload Identity Federation via the step's OIDC token — no
-# long-lived service account keys anywhere (CLAUDE.md → Stack).
+# long-lived service account keys anywhere. The same GCP service account is
+# used both to authenticate the pipeline (the OIDC exchange) and as the
+# Cloud Run service's own runtime identity (--service-account on `gcloud run
+# deploy`) — there is no separate deploy-time vs. runtime service account,
+# matching bitbucket-pipelines-frontend.yml.
 #
-# Bitbucket variables (dev):
-#   DEV_WORKLOAD_IDENTITY_PROVIDER_ID     — already set (workspace-level)
-#   DEV_ENVIRONMENT_GCP_SERVICE_ACCOUNT   — already set (workspace-level)
-#   DEV_ENVIRONMENT_GCP_PROJECT_ID        — already set (workspace-level)
-#   DEV_ENVIRONMENT_GCP_REGION            — already set (workspace-level)
-#   DEV_ENVIRONMENT_ARTIFACT_REGISTRY     — already set (workspace-level)
-#   DEV_ENVIRONMENT_FRONTEND_BASE_URL     — NEW. Joi-required at app boot
-#                                            (src/app.module.ts), but the
-#                                            frontend has no URL yet either on
-#                                            a first run — the deploy step
-#                                            below falls back to a placeholder
-#                                            when this is unset (with a loud
-#                                            WARNING) instead of failing the
-#                                            pipeline, purely so build+push+
-#                                            deploy can be proven end-to-end
-#                                            before real cross-service URLs
-#                                            exist. Set this for real once the
-#                                            frontend has a Cloud Run URL —
-#                                            CORS won't accept it until then.
+# WHY THE BUILD HAPPENS OUTSIDE DOCKER (added 2026-08-11): `next build` used
+# to run inside the "Build & Push Docker Image" step's `docker build`, via
+# the Docker-in-Docker sidecar (`services: [docker]`). That nested-build
+# context is a known trap for Next.js's Turbopack — it tends to over-detect
+# available CPU and thrash instead of just running slower — and it did here:
+# the identical `npm run build` that takes seconds in the plain
+# node:22-alpine step below took over two hours inside `docker build` and
+# got killed by Bitbucket's 120-minute step limit. Fix: build once in "Build
+# Next.js App" (plain container, no Docker-in-Docker), pass the build output
+# to the next step as pipeline artifacts, and have the Docker step only
+# package it — see the Dockerfile's own header comment for the runner side
+# of this.
 #
-# Optional (deploy step no-ops around these if unset):
-#   DEV_ENVIRONMENT_SESSION_COOKIE_DOMAIN     — cookie Domain attribute
-#   DEV_ENVIRONMENT_SESSION_JWT_SECRET_NAME   — Secret Manager secret name;
-#                                                 WITHOUT this, the app falls
-#                                                 back to the insecure
-#                                                 hardcoded dev secret
-#                                                 (src/modules/auth/auth.module.ts)
-#   DEV_ENVIRONMENT_CLOUD_RUN_SERVICE_ACCOUNT — runtime identity for the Cloud
-#                                                 Run revision; without it,
-#                                                 Cloud Run uses the project's
-#                                                 default compute service account
+# SPM-187/188 — Google IAP now authenticates every user in front of this
+# service, and both backends are private, so NEXT_PUBLIC_API_BASE_URL /
+# NEXT_PUBLIC_CHAT_API_BASE_URL are gone: the browser never calls a backend
+# URL directly anymore, only this app's own same-origin BFF routes. Nothing
+# is baked into the browser bundle at `next build` time anymore, so the
+# build step needs no backend URLs at all — they're all runtime-only
+# `--set-env-vars` on the deploy step instead.
 #
-# Note on FRONTEND_ORIGIN: src/main.ts's CORS reads FRONTEND_ORIGIN, but the
-# Joi schema validates FRONTEND_BASE_URL — two different env vars for what's
-# meant to be the same frontend URL. This pipeline sets both from the single
-# DEV_ENVIRONMENT_FRONTEND_BASE_URL variable so CORS works regardless of which
-# name the code reads. Worth a follow-up ticket to unify the two in code.
+# The Cloud Run service is never publicly reachable: `gcloud run deploy`
+# always passes --no-allow-unauthenticated, on top of Google IAP sitting in
+# front of it. There is no allow-unauthenticated override for any branch.
+#
+# ENVIRONMENT RESOLUTION
+# ----------------------
+# The "Get Environment Variables" step maps $BITBUCKET_BRANCH (dev/qa/main)
+# to a set of generic ENVIRONMENT_* values, each sourced from a
+# per-environment prefixed variable (DEV_/QA_/PROD_). Every later step reads
+# only the generic ENVIRONMENT_* name — this is what lets the same four step
+# definitions run unchanged across all three branches, the same pattern
+# bitbucket-pipelines-frontend.yml uses.
+#
+# Required Bitbucket repository variables — add these (this pipeline reads
+# them but does not define them). {PREFIX} is DEV, QA, or PROD to match the
+# branch:
+#
+#   {PREFIX}_WORKLOAD_IDENTITY_PROVIDER_ID          — WIF provider for the
+#                                                      OIDC auth exchange
+#   {PREFIX}_ENVIRONMENT_GCP_SERVICE_ACCOUNT        — SA impersonated for
+#                                                      that OIDC exchange AND
+#                                                      used as the Cloud Run
+#                                                      runtime identity
+#   {PREFIX}_ENVIRONMENT_GCP_PROJECT_ID
+#   {PREFIX}_ENVIRONMENT_GCP_REGION
+#   {PREFIX}_ENVIRONMENT_ARTIFACT_REGISTRY
+#   {PREFIX}_ENVIRONMENT_IAP_AUDIENCE               — Cloud Run v2 IAP
+#                                                      resource name, e.g.
+#                                                      /projects/<project_number>/locations/<region>/services/<service>
+#                                                      (Console → Security →
+#                                                      Identity-Aware Proxy →
+#                                                      this resource →
+#                                                      signed header JWT
+#                                                      audience). If unset,
+#                                                      src/lib/iap.ts's
+#                                                      verifyIapAssertion()
+#                                                      bails out before even
+#                                                      inspecting the
+#                                                      assertion, and every
+#                                                      request gets a bare
+#                                                      401.
+#   {PREFIX}_ENVIRONMENT_INTERNAL_API_BASE_URL      — Backend A's private
+#                                                      Cloud Run URL for this
+#                                                      environment (its
+#                                                      status.url, the
+#                                                      hash-based alias — it
+#                                                      must match exactly for
+#                                                      ServiceIdentityGuard's
+#                                                      audience check)
+#   {PREFIX}_ENVIRONMENT_INTERNAL_CHAT_API_BASE_URL — Backend B's private
+#                                                      Cloud Run URL for this
+#                                                      environment
+#
+# DEV_WORKLOAD_IDENTITY_PROVIDER_ID, DEV_ENVIRONMENT_GCP_SERVICE_ACCOUNT,
+# DEV_ENVIRONMENT_GCP_PROJECT_ID, DEV_ENVIRONMENT_GCP_REGION and
+# DEV_ENVIRONMENT_ARTIFACT_REGISTRY already exist at the workspace level
+# (inherited from the backend pipeline) — nothing to add for those five.
+# Every other variable above — the three DEV_ENVIRONMENT_IAP_AUDIENCE /
+# INTERNAL_API_BASE_URL / INTERNAL_CHAT_API_BASE_URL variables, and the full
+# QA_*/PROD_* set — does not exist yet and must be added before the
+# corresponding branch pipeline will run. qa and main additionally need
+# their own GCP projects to exist first.
+#
+# SELF_BASE_URL (this app's own URL, needed for server-side self-fetches of
+# its own BFF proxy routes) is not part of the list above — it can't be
+# known until Cloud Run assigns this service its URL, so the deploy step
+# deploys once with a placeholder, then patches it in via `gcloud run
+# services update --update-env-vars` once the real URL is known — see that
+# step's own comment.
 
 image: google/cloud-sdk:latest
 
+# `docker: true` deliberately NOT set here as a global option — see the
+# "WHY THE BUILD HAPPENS OUTSIDE DOCKER" header comment above. As a global
+# option it attaches a Docker sidecar to EVERY step, lint_typecheck_test and
+# build_app included, which reproduces the exact nested-daemon hang that
+# comment describes even though neither of those steps calls `docker` at
+# all. Only build_and_push_image declares `services: [docker]` for itself,
+# since it's the only step that actually builds an image.
 options:
-  docker: true
   size: 2x
 
 definitions:
@@ -63,26 +127,90 @@ definitions:
     npm: ~/.npm
 
   steps:
-    - step: &lint_test_build
-        name: Lint, Test & Build
+    - step: &get_env_variable
+        name: Get Environment Variables
+        script:
+          - echo "Getting Environment Variables..."
+          - |
+            if [[ "$BITBUCKET_BRANCH" == "dev" ]]; then
+              echo ENVIRONMENT_WORKLOAD_IDENTITY_PROVIDER_ID=$DEV_WORKLOAD_IDENTITY_PROVIDER_ID >> $BITBUCKET_PIPELINES_VARIABLES_PATH
+              echo ENVIRONMENT_GCP_SERVICE_ACCOUNT=$DEV_ENVIRONMENT_GCP_SERVICE_ACCOUNT >> $BITBUCKET_PIPELINES_VARIABLES_PATH
+              echo ENVIRONMENT_GCP_PROJECT_ID=$DEV_ENVIRONMENT_GCP_PROJECT_ID >> $BITBUCKET_PIPELINES_VARIABLES_PATH
+              echo ENVIRONMENT_GCP_REGION=$DEV_ENVIRONMENT_GCP_REGION >> $BITBUCKET_PIPELINES_VARIABLES_PATH
+              echo ENVIRONMENT_ARTIFACT_REGISTRY=$DEV_ENVIRONMENT_ARTIFACT_REGISTRY >> $BITBUCKET_PIPELINES_VARIABLES_PATH
+              echo ENVIRONMENT_IAP_AUDIENCE=$DEV_ENVIRONMENT_IAP_AUDIENCE >> $BITBUCKET_PIPELINES_VARIABLES_PATH
+              echo ENVIRONMENT_INTERNAL_API_BASE_URL=$DEV_ENVIRONMENT_INTERNAL_API_BASE_URL >> $BITBUCKET_PIPELINES_VARIABLES_PATH
+              echo ENVIRONMENT_INTERNAL_CHAT_API_BASE_URL=$DEV_AI_BACKEND_URL >> $BITBUCKET_PIPELINES_VARIABLES_PATH
+              echo ENVIRONMENT=dev >> $BITBUCKET_PIPELINES_VARIABLES_PATH
+            elif [[ "$BITBUCKET_BRANCH" == "qa" ]]; then
+              echo ENVIRONMENT_WORKLOAD_IDENTITY_PROVIDER_ID=$QA_WORKLOAD_IDENTITY_PROVIDER_ID >> $BITBUCKET_PIPELINES_VARIABLES_PATH
+              echo ENVIRONMENT_GCP_SERVICE_ACCOUNT=$QA_ENVIRONMENT_GCP_SERVICE_ACCOUNT >> $BITBUCKET_PIPELINES_VARIABLES_PATH
+              echo ENVIRONMENT_GCP_PROJECT_ID=$QA_ENVIRONMENT_GCP_PROJECT_ID >> $BITBUCKET_PIPELINES_VARIABLES_PATH
+              echo ENVIRONMENT_GCP_REGION=$QA_ENVIRONMENT_GCP_REGION >> $BITBUCKET_PIPELINES_VARIABLES_PATH
+              echo ENVIRONMENT_ARTIFACT_REGISTRY=$QA_ENVIRONMENT_ARTIFACT_REGISTRY >> $BITBUCKET_PIPELINES_VARIABLES_PATH
+              echo ENVIRONMENT_IAP_AUDIENCE=$QA_ENVIRONMENT_IAP_AUDIENCE >> $BITBUCKET_PIPELINES_VARIABLES_PATH
+              echo ENVIRONMENT_INTERNAL_API_BASE_URL=$QA_ENVIRONMENT_INTERNAL_API_BASE_URL >> $BITBUCKET_PIPELINES_VARIABLES_PATH
+              echo ENVIRONMENT_INTERNAL_CHAT_API_BASE_URL=$QA_AI_BACKEND_URL >> $BITBUCKET_PIPELINES_VARIABLES_PATH
+              echo ENVIRONMENT=qa >> $BITBUCKET_PIPELINES_VARIABLES_PATH
+            elif [[ "$BITBUCKET_BRANCH" == "main" ]]; then
+              echo ENVIRONMENT_WORKLOAD_IDENTITY_PROVIDER_ID=$PROD_WORKLOAD_IDENTITY_PROVIDER_ID >> $BITBUCKET_PIPELINES_VARIABLES_PATH
+              echo ENVIRONMENT_GCP_SERVICE_ACCOUNT=$PROD_ENVIRONMENT_GCP_SERVICE_ACCOUNT >> $BITBUCKET_PIPELINES_VARIABLES_PATH
+              echo ENVIRONMENT_GCP_PROJECT_ID=$PROD_ENVIRONMENT_GCP_PROJECT_ID >> $BITBUCKET_PIPELINES_VARIABLES_PATH
+              echo ENVIRONMENT_GCP_REGION=$PROD_ENVIRONMENT_GCP_REGION >> $BITBUCKET_PIPELINES_VARIABLES_PATH
+              echo ENVIRONMENT_ARTIFACT_REGISTRY=$PROD_ENVIRONMENT_ARTIFACT_REGISTRY >> $BITBUCKET_PIPELINES_VARIABLES_PATH
+              echo ENVIRONMENT_IAP_AUDIENCE=$PROD_ENVIRONMENT_IAP_AUDIENCE >> $BITBUCKET_PIPELINES_VARIABLES_PATH
+              echo ENVIRONMENT_INTERNAL_API_BASE_URL=$PROD_ENVIRONMENT_INTERNAL_API_BASE_URL >> $BITBUCKET_PIPELINES_VARIABLES_PATH
+              echo ENVIRONMENT_INTERNAL_CHAT_API_BASE_URL=$PROD_AI_BACKEND_URL >> $BITBUCKET_PIPELINES_VARIABLES_PATH
+              echo ENVIRONMENT=prod >> $BITBUCKET_PIPELINES_VARIABLES_PATH
+            else
+              echo "Branch does not match any known environments. Exiting..."
+              exit 1
+            fi
+        output-variables:
+          - ENVIRONMENT
+          - ENVIRONMENT_WORKLOAD_IDENTITY_PROVIDER_ID
+          - ENVIRONMENT_GCP_SERVICE_ACCOUNT
+          - ENVIRONMENT_GCP_PROJECT_ID
+          - ENVIRONMENT_GCP_REGION
+          - ENVIRONMENT_ARTIFACT_REGISTRY
+          - ENVIRONMENT_IAP_AUDIENCE
+          - ENVIRONMENT_INTERNAL_API_BASE_URL
+          - ENVIRONMENT_INTERNAL_CHAT_API_BASE_URL
+
+    - step: &lint_typecheck_test
+        name: Lint, Typecheck & Test
         image: node:22-alpine
         caches:
           - npm
         script:
           - set -euo pipefail
-          - npm ci
+          - export HUSKY=0
+          - npm ci --include=optional
           - echo "Linting..."
-          - npx eslint "{src,apps,libs,test}/**/*.ts"
-          # AppModule's Joi schema requires FRONTEND_BASE_URL at module init,
-          # which the unit/e2e suites trigger via createTestingModule/bootstrap.
-          - export FRONTEND_BASE_URL=http://localhost:3000
-          - echo "Running unit tests..."
+          - npm run lint
+          - echo "Typechecking..."
+          - npm run typecheck
+          - echo "Running tests..."
           - npm test
-          - echo "Running e2e tests..."
-          - npm run test:e2e
-          # Proves `nest build` succeeds before spending time on a Docker build.
+
+    - step: &build_app
+        name: Build Next.js App
+        image: node:22-alpine
+        caches:
+          - npm
+        script:
+          - set -euo pipefail
+          - export HUSKY=0
+          - npm ci --include=optional
+          # No backend URLs to resolve here anymore (SPM-188) — nothing gets
+          # baked into the browser bundle; INTERNAL_API_BASE_URL,
+          # INTERNAL_CHAT_API_BASE_URL, IAP_AUDIENCE, and SELF_BASE_URL are
+          # all runtime-only and set on the deploy step instead.
           - echo "Building..."
           - npm run build
+        artifacts:
+          - .next/standalone/**
+          - .next/static/**
 
     - step: &build_and_push_image
         name: Build & Push Docker Image
@@ -96,23 +224,32 @@ definitions:
             AUTH_DIR="$(mktemp -d)"
             printf '%s' "$BITBUCKET_STEP_OIDC_TOKEN" > "${AUTH_DIR}/oidc-token.txt"
             gcloud iam workload-identity-pools create-cred-config \
-              "${DEV_WORKLOAD_IDENTITY_PROVIDER_ID}" \
-              --service-account="${DEV_ENVIRONMENT_GCP_SERVICE_ACCOUNT}" \
+              "${ENVIRONMENT_WORKLOAD_IDENTITY_PROVIDER_ID}" \
+              --service-account="${ENVIRONMENT_GCP_SERVICE_ACCOUNT}" \
               --output-file="${AUTH_DIR}/credentials.json" \
               --credential-source-file="${AUTH_DIR}/oidc-token.txt"
             export GOOGLE_APPLICATION_CREDENTIALS="${AUTH_DIR}/credentials.json"
             gcloud auth login --cred-file="${AUTH_DIR}/credentials.json"
-            gcloud config set project "${DEV_ENVIRONMENT_GCP_PROJECT_ID}"
+            gcloud config set project "${ENVIRONMENT_GCP_PROJECT_ID}"
             gcloud auth list
           - |
             set -euo pipefail
-            gcloud auth configure-docker "${DEV_ENVIRONMENT_GCP_REGION}-docker.pkg.dev" --quiet
+            gcloud auth configure-docker "${ENVIRONMENT_GCP_REGION}-docker.pkg.dev" --quiet
 
             TAG="$(date +%Y%m%d%H%M%S)-${BITBUCKET_BUILD_NUMBER}"
             IMAGE_NAME="${BITBUCKET_REPO_SLUG}"
-            IMAGE_BASE="${DEV_ENVIRONMENT_GCP_REGION}-docker.pkg.dev/${DEV_ENVIRONMENT_GCP_PROJECT_ID}/${DEV_ENVIRONMENT_ARTIFACT_REGISTRY}/${IMAGE_NAME}"
+            IMAGE_BASE="${ENVIRONMENT_GCP_REGION}-docker.pkg.dev/${ENVIRONMENT_GCP_PROJECT_ID}/${ENVIRONMENT_ARTIFACT_REGISTRY}/${IMAGE_NAME}"
             echo "Image will be ${IMAGE_BASE}:${TAG}"
 
+            # .next/standalone and .next/static are restored from the "Build
+            # Next.js App" step's artifacts (already in this checkout) — this
+            # step never runs `next build` itself, see the Dockerfile header.
+            # No --build-arg for INTERNAL_API_BASE_URL/INTERNAL_CHAT_API_BASE_URL/
+            # IAP_AUDIENCE/SELF_BASE_URL: they're runtime-only and set via
+            # --set-env-vars on the deploy step, not baked into the image.
+            # The Dockerfile's ARGs for them default to empty and only matter
+            # for someone manually building/running the image outside this
+            # pipeline.
             docker build --pull \
               --label "org.opencontainers.image.revision=${BITBUCKET_COMMIT}" \
               --label "org.opencontainers.image.version=${TAG}" \
@@ -131,38 +268,21 @@ definitions:
           - build_info.txt
 
     - step: &deploy_cloud_run
-        name: Deploy to Cloud Run (dev)
+        name: Deploy to Cloud Run
         oidc: true
         script:
-          - |
-            set -euo pipefail
-            echo "Validating deploy variables..."
-
-            # BOOTSTRAP FALLBACK — remove once the frontend has a real dev URL.
-            # FRONTEND_BASE_URL is Joi-required at boot (src/app.module.ts), but
-            # the frontend isn't deployed yet either, so there's no real value to
-            # pass on a first run. Falls back to an RFC 2606 "always invalid"
-            # placeholder so the app boots and the pipeline can prove build+push+
-            # deploy work end-to-end. CORS will not accept a real frontend origin
-            # until DEV_ENVIRONMENT_FRONTEND_BASE_URL is set to the frontend's
-            # actual Cloud Run URL — no pipeline change needed then, just add the
-            # Bitbucket variable and re-run.
-            export RESOLVED_FRONTEND_BASE_URL="${DEV_ENVIRONMENT_FRONTEND_BASE_URL:-https://placeholder-frontend.dev.invalid}"
-            if [ -z "${DEV_ENVIRONMENT_FRONTEND_BASE_URL:-}" ]; then
-              echo "WARNING: DEV_ENVIRONMENT_FRONTEND_BASE_URL not set — deploying with"
-              echo "placeholder ${RESOLVED_FRONTEND_BASE_URL}. CORS will reject the real"
-              echo "frontend until this variable is set to its actual Cloud Run URL."
-            fi
-
-            if [ -z "${DEV_ENVIRONMENT_SESSION_JWT_SECRET_NAME:-}" ]; then
-              echo "WARNING: DEV_ENVIRONMENT_SESSION_JWT_SECRET_NAME is not set."
-              echo "Deploying WITHOUT a real session secret — the app falls back to"
-              echo "the hardcoded insecure dev default. Fine for a first smoke test,"
-              echo "not fine to leave this way."
-            fi
           - *gcp_auth
           - |
             set -euo pipefail
+
+            echo "Validating environment variables..."
+            if [ -z "${ENVIRONMENT_GCP_PROJECT_ID:-}" ] || [ -z "${ENVIRONMENT_GCP_REGION:-}" ] || \
+               [ -z "${ENVIRONMENT_GCP_SERVICE_ACCOUNT:-}" ] || [ -z "${ENVIRONMENT_IAP_AUDIENCE:-}" ] || \
+               [ -z "${ENVIRONMENT_INTERNAL_API_BASE_URL:-}" ] || [ -z "${ENVIRONMENT_INTERNAL_CHAT_API_BASE_URL:-}" ]; then
+              echo "ERROR: one or more ENVIRONMENT_* variables are empty for branch '${BITBUCKET_BRANCH}'." >&2
+              echo "Check that the matching {PREFIX}_* repository variable is set — see this file's header comment for the full list." >&2
+              exit 1
+            fi
 
             IMAGE_URI="$(grep '^IMAGE_URI=' build_info.txt | cut -d'=' -f2-)"
             if [[ -z "$IMAGE_URI" ]]; then
@@ -174,28 +294,34 @@ definitions:
 
             SERVICE_NAME="${BITBUCKET_REPO_SLUG}"
 
-            DEPLOY_ARGS=""
-            if [ -n "${DEV_ENVIRONMENT_CLOUD_RUN_SERVICE_ACCOUNT:-}" ]; then
-              DEPLOY_ARGS="${DEPLOY_ARGS} --service-account=${DEV_ENVIRONMENT_CLOUD_RUN_SERVICE_ACCOUNT}"
-            fi
-            if [ -n "${DEV_ENVIRONMENT_SESSION_JWT_SECRET_NAME:-}" ]; then
-              DEPLOY_ARGS="${DEPLOY_ARGS} --set-secrets=SESSION_JWT_SECRET=${DEV_ENVIRONMENT_SESSION_JWT_SECRET_NAME}:latest"
-            fi
+            echo "Deploying ${IMAGE_URI} to ${SERVICE_NAME} (${ENVIRONMENT})..."
 
-            echo "Deploying ${IMAGE_URI} to ${SERVICE_NAME} (dev)..."
-
-            # --allow-unauthenticated: the browser calls this API directly with
-            # the session cookie (API_SPEC.md §Authentication) and cannot present
-            # a Google IAM token — authorization is the session cookie itself,
-            # enforced in-app. PORT is deliberately absent from --set-env-vars:
-            # Cloud Run reserves it and injects it from --port; src/main.ts reads
-            # it at runtime. ^@^ picks @ as the delimiter so values may safely
-            # contain commas (e.g. a comma in a cookie domain list).
+            # SELF_BASE_URL isn't known until Cloud Run assigns this service
+            # its own URL, so the first deploy ships a placeholder — nothing
+            # currently calls it at request time (no Server Component calls
+            # the BFF proxy server-side yet), but src/services/http.ts throws
+            # a clear error if that ever changes and it's still unset, so
+            # this keeps it correct regardless. The `gcloud run services
+            # update` below patches in the real value.
+            #
+            # --no-allow-unauthenticated: this service is never called
+            # directly by end users. Google IAP fronts it, and the Cloud Run
+            # IAM invoker binding stays private on top of that — there is no
+            # public entry point at either layer.
+            #
+            # --service-account uses the same SA the OIDC exchange above
+            # authenticated as (ENVIRONMENT_GCP_SERVICE_ACCOUNT) — it is both
+            # the deployer identity and the Cloud Run runtime identity.
+            #
+            # PORT is deliberately absent from --set-env-vars: Cloud Run
+            # reserves it and injects it from --port; the Next standalone
+            # server reads it at runtime.
             gcloud run deploy "${SERVICE_NAME}" \
               --image "${IMAGE_URI}" \
-              --region "${DEV_ENVIRONMENT_GCP_REGION}" \
+              --region "${ENVIRONMENT_GCP_REGION}" \
+              --service-account="${ENVIRONMENT_GCP_SERVICE_ACCOUNT}" \
               --platform managed \
-              --allow-unauthenticated \
+              --no-allow-unauthenticated \
               --port 8080 \
               --cpu 1 \
               --memory 512Mi \
@@ -203,43 +329,58 @@ definitions:
               --min-instances 0 \
               --max-instances 10 \
               --timeout 300 \
-              --labels "app=spms-backend-a,env=dev,commit=${BITBUCKET_COMMIT}" \
-              --set-env-vars "^@^NODE_ENV=production@FRONTEND_BASE_URL=${RESOLVED_FRONTEND_BASE_URL}@FRONTEND_ORIGIN=${RESOLVED_FRONTEND_BASE_URL}@SESSION_COOKIE_DOMAIN=${DEV_ENVIRONMENT_SESSION_COOKIE_DOMAIN:-}" \
-              ${DEPLOY_ARGS} \
+              --labels "app=spms-frontend,env=${ENVIRONMENT},commit=${BITBUCKET_COMMIT}" \
+              --set-env-vars "INTERNAL_API_BASE_URL=${ENVIRONMENT_INTERNAL_API_BASE_URL},INTERNAL_CHAT_API_BASE_URL=${ENVIRONMENT_INTERNAL_CHAT_API_BASE_URL},IAP_AUDIENCE=${ENVIRONMENT_IAP_AUDIENCE},SELF_BASE_URL=https://placeholder.invalid" \
               --quiet
 
             SERVICE_URL="$(gcloud run services describe "${SERVICE_NAME}" \
-              --region "${DEV_ENVIRONMENT_GCP_REGION}" \
+              --region "${ENVIRONMENT_GCP_REGION}" \
               --format='value(status.url)')"
             echo "Deployed successfully! Service URL: ${SERVICE_URL}"
 
-            # Routes live under the /api/v1 global prefix (src/main.ts
-            # setGlobalPrefix), so bare / would 404.
-            #
+            echo "Setting SELF_BASE_URL to the service's own URL..."
+            gcloud run services update "${SERVICE_NAME}" \
+              --region "${ENVIRONMENT_GCP_REGION}" \
+              --update-env-vars "SELF_BASE_URL=${SERVICE_URL}" \
+              --quiet
+
             # No -f here (deliberately): this only logs the status code, it
-            # does not gate the pipeline on it. --allow-unauthenticated above
-            # asks Cloud Run to bind allUsers as roles/run.invoker, but the
-            # deploying service account currently lacks permission to set that
-            # IAM policy (gcloud prints "Setting IAM policy failed" a few
-            # lines up, non-fatal to the deploy itself) — so the service is
-            # still invoker-only right now and this check will report 403
-            # until that's fixed. Tracked in docs/JIRA-cloud-run-public-access.md;
-            # -f would turn that known, tracked gap into a red pipeline step
-            # for no actionable reason. Once the IAM binding is fixed, a
-            # non-200 here again means something newly wrong and worth
-            # re-adding -f for.
-            echo "Smoke checking ${SERVICE_URL}/api/v1 ..."
+            # does not gate the pipeline on it. With --no-allow-unauthenticated,
+            # an unauthenticated curl is expected to be rejected (403 from
+            # Cloud Run IAM, or intercepted by IAP first) — that is the
+            # correct, private-by-default behaviour, not a failure.
+            echo "Smoke checking ${SERVICE_URL} ..."
             curl -sS --retry 3 --retry-delay 5 \
               -o /dev/null -w 'smoke check returned HTTP %{http_code}\n' \
-              "${SERVICE_URL}/api/v1"
+              "${SERVICE_URL}"
 
 pipelines:
+  # PRs into any branch only lint/typecheck/test — no Docker build, no GCP
+  # auth, no deploy. This is the pre-merge gate: catch a broken build/test on
+  # the feature branch itself, before it ever reaches dev. Only a push that
+  # lands on dev, qa, or main runs the full build-and-deploy below.
+  pull-requests:
+    '**':
+      - step: *lint_typecheck_test
+
   branches:
     dev:
-      - step: *lint_test_build
+      - step: *get_env_variable
+      - step: *lint_typecheck_test
+      - step: *build_app
       - step: *build_and_push_image
       - step: *deploy_cloud_run
-    feature/SPM-54-pipeline-backend:
-      - step: *lint_test_build
+
+    qa:
+      - step: *get_env_variable
+      - step: *lint_typecheck_test
+      - step: *build_app
+      - step: *build_and_push_image
+      - step: *deploy_cloud_run
+
+    main:
+      - step: *get_env_variable
+      - step: *lint_typecheck_test
+      - step: *build_app
       - step: *build_and_push_image
       - step: *deploy_cloud_run
