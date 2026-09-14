@@ -58,14 +58,23 @@ unaffected by `iam.allowedPolicyMemberDomains` and needs no exception.
 
 The full step-by-step runbook — APIs, VPC creation, the service-networking
 peering Cloud SQL private IP requires, instance creation, Direct VPC egress
-on Cloud Run, IAM grant, NestJS connector wiring (with `AUTO_IAM_AUTHN` so no
-DB password exists), secrets handling, and verification — was written up for
-the GCP team as a shareable document, including a revision-history table
-recording the public-IP attempt and why it was superseded. Ask Carlos for the
-current link if it's not attached to the ticket this file is referenced from.
+on Cloud Run, IAM grants (including the permission gap found when actually
+checking for them — see that doc's §2), Bitbucket variables, pipeline diff,
+and verification — now lives in this same repo:
+`docs/vpc-backend-cloudsql-implementation.md`. That supersedes the "ask
+Carlos for the link" note this section used to carry — it's in-repo now, not
+a separate shared artifact.
 
-## Open item
+## Runtime service account (dev — confirmed 2026-09-08)
 
-The backend Cloud Run service's exact runtime service account email wasn't
-captured in this repo or in memory — the runbook flags it as a value the GCP
-team needs to confirm from the Security tab before the IAM-grant step.
+`s6-na-gss-dev-cebos-qms-sa@prj-na-gss-supp-perform-d-219.iam.gserviceaccount.com`,
+pulled from `gcloud run services describe supp-perf-mgmt-backend`'s YAML
+output (`spec.template.spec.serviceAccountName`). Its name suggests it's
+shared with an unrelated system ("CEBOS QMS"), not dedicated to this backend
+— worth confirming that's intentional before granting `roles/cloudsql.client`
+/ `roles/compute.networkUser` to it, since those would apply everywhere else
+this SA is used too.
+
+qa (`prj-na-gss-supp-perform-q-373`) and prod (`prj-na-gss-supp-perform-p-443`)
+each need the same lookup done against their own backend service once it
+exists there — don't assume this same SA carries over.

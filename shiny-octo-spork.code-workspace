@@ -1,0 +1,17 @@
+{
+	"folders": [
+		{
+			"path": "."
+		},
+		{
+			"path": "../../home/codespace/supp-perf-mgmt-ai"
+		},
+		{
+			"path": "../../home/codespace/supp-perf-mgmt-frontend"
+		},
+		{
+			"path": "../../home/codespace/supp-perf-mgmt-backend"
+		}
+	],
+	"settings": {}
+}

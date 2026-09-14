@@ -26,6 +26,50 @@ Note the split: this sandbox is on **GitHub**, the real repos are on
 never run in this repo's own CI — it is authored here and copied to a Bitbucket
 repo to actually execute.
 
+## Working style
+
+These are standing instructions on *how* to troubleshoot and communicate in
+this workspace, not about the repo's content. They override default behavior.
+
+- **Don't re-litigate old context.** Once a bug or a past troubleshooting
+  thread is resolved or superseded, stop bringing it up. Only reference prior
+  issues when they're actually load-bearing for the current fix (the
+  disproven SA-permissions theory under "Current state of the infrastructure
+  work" is a real example of one worth keeping, precisely because re-deriving
+  it wastes a pipeline run). Otherwise, state the current problem and the
+  current fix without recapping how the session got there.
+- **Escalation — tickets, admin asks, permission grants — is the last resort,
+  not the first hypothesis.** Check whether the failing step is even
+  necessary before assuming a permissions problem; removing a non-essential
+  command is a legitimate fix. Real case, don't re-derive it fresh:
+  `docs/qa-pipeline-containeranalysis-permission-gap.md` — a ticket went out
+  on an IAM-grant theory before anyone checked whether the failing check was
+  load-bearing; it wasn't, and the real fix was commenting it out. Don't
+  recommend a ticket unless the diagnosis is solid enough to survive someone
+  else checking it.
+- **Lead with the lowest-effort fix, and when it's not obvious, give ranked
+  options — cheapest and most-local first** (including "just remove/disable
+  it") — rather than committing to a single path immediately. Say briefly
+  why each ranks where it does (effort, reversibility, what it depends on
+  someone else granting) so the choice is the user's, not assumed.
+- **State assumptions and ask instead of guessing** when a requirement is
+  ambiguous; don't build on a silent guess.
+- **Present each option on its own merits — don't staple a repeated
+  non-critical caveat onto it.** A caveat belongs directly on a recommendation
+  only when it's actually blocking or changes that recommendation right now
+  (e.g. "needs an org-policy exception that doesn't exist" makes an option
+  infeasible today). A true-but-non-blocking fact — e.g. "the VPC connector
+  isn't live yet" surfacing again on a Redis/Memorystore suggestion when
+  nothing about *that* recommendation depends on it being live today — reads
+  as hedging, not analysis. Say it once if it's worth saying, not as a
+  qualifier repeated on every option that happens to touch it.
+- **Change only what the task requires.** No adjacent refactors, renames, or
+  speculative abstractions/config nobody asked for.
+- **"Done" needs proof** — a test run, a script, or reproduced output —
+  not just a description of the change.
+- **Keep this file itself short.** Prune a rule once it's clearly followed
+  without it; don't let it pile up as dead weight.
+
 ## Workspace layout
 
 The intent is to have the frontend and backend checked out side by side under
@@ -36,9 +80,7 @@ tracing a frontend call into a backend route) happens in a single session.
 shiny-octo-spork/
 ├── CLAUDE.md                        # this file
 ├── docs/                            # cross-repo findings and reference copies
-│   ├── cloud-run-architecture-issues.md
 │   └── bitbucket-pipelines.yml      # reference copy of the backend's pipeline
-├── minimal/                         # throwaway hello-world pipeline test rig
 ├── supp-perf-mgmt-frontend/         # git-ignored clone (not tracked here)
 └── supp-perf-mgmt-backend/          # git-ignored clone (not tracked here)
 ```
@@ -57,6 +99,13 @@ What this means in practice:
   expectations.
 - If a clone is missing, that is expected on a fresh checkout. Clone it from
   Bitbucket rather than assuming the work belongs here.
+- **Never `git push` (or merge) to `dev`, `qa`, or `main` in a child repo** —
+  not even from inside that directory, not even when asked to "just do it."
+  Those pushes are done personally, by the user, from their own terminal.
+  Editing/staging/committing locally is fine; the push itself is not this
+  agent's call to make. If the user asks to override this for an emergency,
+  don't comply on the first ask — confirm explicitly three separate times
+  before pushing, and only push if all three confirmations hold.
 
 ## Branching
 
@@ -87,67 +136,55 @@ own GCP projects and their own Bitbucket variables (the current ones are all
 
 ## Current state of the infrastructure work
 
-Read `docs/cloud-run-architecture-issues.md` before touching anything
-deploy-related. It is the working record of this effort and is more current
-than this section. The headlines:
+**Decided and live: private, fronted by Google IAP** — not the public
+cookie+CORS option that was once an open fork. `gcloud run deploy` uses
+`--no-allow-unauthenticated` for both frontend and backend; IAP sits in front
+restricted to `whirlpool.com` (`roles/iap.httpsResourceAccessor`); the two
+services and the AI Agent call each other via plain SA-to-SA
+`roles/run.invoker` bindings. See `docs/vpc-backend-cloudsql-implementation.md`
+and `docs/backend-vpc-architecture-diagram.md` for the current wiring. This is
+decided, not an open question — don't reopen it.
 
-**The minimal pipeline test succeeded.** `minimal/` is a dependency-free Node
-hello-world whose only purpose was to prove the Bitbucket → Artifact Registry →
-Cloud Run path in isolation, with no Next.js build and no NestJS compile in the
-way. It worked. The pattern it proves — Workload Identity Federation auth via
-the step's OIDC token, image name and service name derived from
-`BITBUCKET_REPO_SLUG`, deploy an immutable tag rather than `:latest` — is the
-one the real pipelines use.
+**Why: an org policy makes `allUsers` a dead end.** Domain Restricted Sharing
+(`constraints/iam.allowedPolicyMemberDomains`) blocks any IAM binding to
+`allUsers` at the org level — confirmed by real `--allow-unauthenticated`
+failures, and **not** a deploying-SA permissions gap (the SA holds
+`roles/run.admin`; that theory is disproven, don't re-derive it). There is no
+pipeline or code fix short of an org-policy exception at or above folder
+`625301422871` — which is exactly why IAP and specific-principal SA-to-SA
+bindings were chosen instead of chasing that exception.
 
-**The open blocker is an org policy, not a permissions gap.** The original
-theory was that the deploying service account lacked
-`run.services.setIamPolicy`. That theory is **wrong** — the SA holds
-`roles/run.admin`. The real cause is the Domain Restricted Sharing org policy
-(`constraints/iam.allowedPolicyMemberDomains`), which blocks any IAM binding to
-`allUsers` at the org level. `allUsers` belongs to no customer by definition, so
-it can never satisfy that constraint.
+- The post-deploy smoke check deliberately has no `-f` and expects a `403`:
+  with `--no-allow-unauthenticated` + IAP, an unauthenticated request getting
+  rejected is correct private-by-default behavior, not a failure to paper
+  over. Don't "fix" it to expect `200`.
+- A **separate, unrelated** org policy, `constraints/sql.restrictPublicIp`,
+  forces Cloud SQL to private-IP-only in this project — see
+  `docs/cloudsql-postgres-setup.md`. Don't conflate the two.
 
-Consequences to keep in mind:
-
-- **There is no pipeline or code fix for this.** It needs an org-policy
-  exception granted at or above folder `625301422871`. Do not attempt to solve
-  it by editing YAML, and do not re-derive the disproven SA-permissions theory.
-- `--allow-unauthenticated` silently fails, so smoke checks report `403` even
-  on an otherwise-successful deploy. Several smoke checks are deliberately
-  softened (`curl -sS`, not `curl -fsS`) so this known gap doesn't fail the
-  pipeline. Don't "fix" a soft smoke check without knowing why it's soft.
-- Service-to-service auth is unaffected — a plain SA-to-SA `roles/run.invoker`
-  binding is not `allUsers` and works fine. That's how the backend proof of
-  concept is wired.
-
-**An architectural decision is pending** and gates real work: whether the Data
-API stays public (browser cookie + CORS) or goes private (IAM-authenticated
-service-to-service, which is a re-architecture, not a flag change). Section 1 of
-the issues doc lays out the conflict. Don't pick a side unilaterally — if a task
-depends on the answer, surface it.
-
-**Known temporary workarounds are tracked in §4 of the issues doc.** Temporary
-branch triggers, softened smoke checks, hardcoded URLs, placeholder domains.
-None should survive to `qa`/`main`. When you touch a file containing one, leave
-it in place unless removing it is the task, but do flag it.
+**Known temporary workarounds still in the pipelines** (e.g. the
+`SELF_BASE_URL=https://placeholder.invalid` first-deploy placeholder in the
+frontend deploy step) should not survive to `qa`/`main` unchanged. Leave one
+in place unless removing it is the task, but flag it.
 
 ## Working conventions
 
-- **Explain the why in comments.** The existing pipeline YAML, Dockerfile, and
-  `server.js` all carry comments explaining *why* a choice was made — why `PORT`
-  is read from the environment, why the smoke check has no `-f`, why the image
-  is single-stage. Match that density. This repo's value is largely the
-  reasoning it captures, not the code.
-- **Keep `minimal/` minimal.** It is a control experiment. Its worth comes from
-  having no dependencies and no build step, so a failure can only be the
-  plumbing. Don't add a framework, dependencies, or app features to it.
-- **Bitbucket only reads `bitbucket-pipelines.yml` at a repo's root.** A
-  pipeline file in a subfolder here never runs. Files like
-  `minimal/bitbucket-pipelines.yml` and `docs/bitbucket-pipelines.yml` are
-  authoring copies and reference copies respectively.
-- **Reference copies drift.** `docs/bitbucket-pipelines.yml` is a snapshot of
-  the backend's real pipeline. Don't trust it as current — check the actual
-  repo before basing a change on it.
+- **A pipeline step failing doesn't mean it's essential** — same principle as
+  under "Working style," applied to pipeline YAML specifically. Before
+  reaching for an IAM grant or a workaround, confirm the failing command
+  actually earns its place. `docs/qa-pipeline-containeranalysis-permission-gap.md`
+  is the canonical example: read it before proposing a permission fix for a
+  pipeline failure.
+- **Explain the why in comments.** The pipeline YAML in `docs/` carries
+  comments explaining *why* a choice was made — why `PORT` is read from the
+  environment, why a smoke check has no `-f`, why a flag is `--no-allow-` vs
+  `--allow-`. Match that density. This repo's value is largely the reasoning
+  it captures, not the code.
+- **`docs/bitbucket-pipelines.yml` is a reference copy, not live config, and
+  it drifts.** Bitbucket only ever reads `bitbucket-pipelines.yml` at a
+  repo's root — this file is a snapshot of the backend's real pipeline for
+  reading here. Verify against the actual Bitbucket repo before basing a
+  change on it.
 - **Never commit secrets.** GCP auth is Workload Identity Federation
   specifically so there are no long-lived service account keys anywhere. Keep
   it that way. Config values belong in Bitbucket workspace variables.
