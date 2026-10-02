@@ -151,23 +151,33 @@ to resolve.
    - Console, switched project selector to `prj-na-netsharedsvs-d-295` directly → denied on `resourcemanager.projects.getIamPolicy` for the host project itself
 
    Zero IAM visibility into the host project from either interface —
-   confirmed, not assumed. Sent as one combined ask (confirm-or-grant, not
-   two round-trips) to the network admins:
-   > Can you check whether
-   > `s6-na-gss-dev-cebos-qms-sa@prj-na-gss-supp-perform-d-219.iam.gserviceaccount.com`
-   > has `roles/compute.networkUser` on subnet
-   > `subnet-ue4-sscrworkerpool-d-1` (region `us-east4`) in
-   > `prj-na-netsharedsvs-d-295`? If not, please grant it — needed for
-   > `supp-perf-mgmt-backend` (Cloud Run, project
-   > `prj-na-gss-supp-perform-d-219`) to use Direct VPC egress into that
-   > subnet to reach `spms-db-dev`.
-   ```bash
-   gcloud compute networks subnets add-iam-policy-binding subnet-ue4-sscrworkerpool-d-1 \
-     --project=prj-na-netsharedsvs-d-295 \
-     --region=us-east4 \
-     --member="serviceAccount:s6-na-gss-dev-cebos-qms-sa@prj-na-gss-supp-perform-d-219.iam.gserviceaccount.com" \
-     --role="roles/compute.networkUser"
+   confirmed, not assumed. A ticket was sent asking for this grant on the
+   runtime SA (`s6-na-gss-dev-cebos-qms-sa@...`) — **that targets the wrong
+   identity.**
+
+   **Correction, found before the admins acted on it:** per Google's docs
+   for "Direct VPC egress with a Shared VPC network," the required grant is
+   on the **Cloud Run Service Agent** — a separate, Google-managed
+   per-project robot account, format
+   `service-{PROJECT_NUMBER}@serverless-robot-prod.iam.gserviceaccount.com`
+   — not the runtime SA the container authenticates as. Project number for
+   `prj-na-gss-supp-perform-d-219` is `508857463128` (confirmed via the
+   Cloud Run service's `namespace` field and Cloud SQL's own service
+   account in §1/§4), so the correct principal is:
    ```
+   service-508857463128@serverless-robot-prod.iam.gserviceaccount.com
+   ```
+   Follow-up sent to the ticket to correct the principal:
+   ```bash
+   gcloud projects add-iam-policy-binding prj-na-netsharedsvs-d-295 \
+     --member="serviceAccount:service-508857463128@serverless-robot-prod.iam.gserviceaccount.com" \
+     --role="roles/compute.networkUser" \
+     --condition=None
+   ```
+   (Project-level grant on the host project — simplest of the two options
+   Google documents; the alternative is `compute.networkViewer` on the host
+   project plus `compute.networkUser` scoped to just
+   `subnet-ue4-sscrworkerpool-d-1`.)
 
 3. **`cloudsql.iam_authentication` — resolved**, see §3.
 
