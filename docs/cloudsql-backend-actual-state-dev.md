@@ -81,16 +81,13 @@ The backend's runtime SA is already registered as an IAM-auth Postgres user
 — correctly transformed (`.gserviceaccount.com` dropped), matching the
 `AUTO_IAM_AUTHN` / no-password decision.
 
-**Gap:** `gcloud sql instances describe spms-db-dev --format='value(settings.databaseFlags)'`
-returns **nothing** — confirmed twice. There is no `databaseFlags` key at
-all in the full `describe` dump. `cloudsql.iam_authentication=on` is not
-set. Postgres IAM database auth is off by default, so as it stands today
-**the IAM user above exists but cannot actually log in.** This needs a
-decision: either it's an oversight to fix (`gcloud sql instances patch
---database-flags=cloudsql.iam_authentication=on` — note this restarts the
-instance, it's not a hot patch), or the plan silently changed to
-password-based auth and nobody updated the user/decision to match. Worth
-asking the admins directly rather than assuming either way.
+**Resolved 2026-10-02:** `cloudsql.iam_authentication` was not set (confirmed
+missing from `databaseFlags` via two separate `describe` calls). Added via
+the Cloud SQL console (Edit → Flags and parameters → Add a database flag →
+`cloudsql.iam_authentication` → On → Save, instance restarted). Confirmed
+now showing `cloudsql.iam_authentication: on` under Database flags and
+parameters on the instance's Overview page. The IAM-auth user in §3 can now
+actually authenticate.
 
 ## 4. Cloud Run backend service — confirmed
 
@@ -145,37 +142,40 @@ to resolve.
    `subnet-ue4-sscrworkerpool-d-1` (`10.67.23.64/26`, us-east4) is the
    subnet this backend's Direct VPC egress should use.
 
-2. **`compute.networkUser` on the backend SA in the host project —
-   unverified, check before escalating.** The grant found in §6 is only in
-   `prj-na-gss-supp-perform-d-219`; Shared VPC requires the grant to exist
-   in the host project (or on the specific subnet) instead. Check first,
-   now that the subnet is known:
+2. **`compute.networkUser` on the backend SA in the host project — still
+   open, self-check attempted and blocked.** The grant found in §6 is only
+   in `prj-na-gss-supp-perform-d-219`; Shared VPC requires the grant to
+   exist in the host project (or on the specific subnet) instead. Tried to
+   check directly:
    ```bash
    gcloud compute networks subnets get-iam-policy subnet-ue4-sscrworkerpool-d-1 \
      --project=prj-na-netsharedsvs-d-295 --region=us-east4
    ```
-   - Already lists `s6-na-gss-dev-cebos-qms-sa@prj-na-gss-supp-perform-d-219.iam.gserviceaccount.com`
-     with `roles/compute.networkUser` → done, nothing to request.
-   - Missing, or the command is denied → request from whoever administers
-     `prj-na-netsharedsvs-d-295`:
-     ```bash
-     gcloud compute networks subnets add-iam-policy-binding subnet-ue4-sscrworkerpool-d-1 \
-       --project=prj-na-netsharedsvs-d-295 \
-       --region=us-east4 \
-       --member="serviceAccount:s6-na-gss-dev-cebos-qms-sa@prj-na-gss-supp-perform-d-219.iam.gserviceaccount.com" \
-       --role="roles/compute.networkUser"
-     ```
+   Result: `HTTPError 403: Required 'compute.subnetworks.getIamPolicy'
+   permission` — this is about the calling user's own lack of read access
+   to that resource, not evidence either way about whether the backend SA
+   has the role. Since self-verification is blocked, this goes to the
+   network admins as one combined ask (confirm-or-grant, not two
+   round-trips):
+   > Can you check whether
+   > `s6-na-gss-dev-cebos-qms-sa@prj-na-gss-supp-perform-d-219.iam.gserviceaccount.com`
+   > has `roles/compute.networkUser` on subnet
+   > `subnet-ue4-sscrworkerpool-d-1` (region `us-east4`) in
+   > `prj-na-netsharedsvs-d-295`? If not, please grant it — needed for
+   > `supp-perf-mgmt-backend` (Cloud Run, project
+   > `prj-na-gss-supp-perform-d-219`) to use Direct VPC egress into that
+   > subnet to reach `spms-db-dev`.
+   ```bash
+   gcloud compute networks subnets add-iam-policy-binding subnet-ue4-sscrworkerpool-d-1 \
+     --project=prj-na-netsharedsvs-d-295 \
+     --region=us-east4 \
+     --member="serviceAccount:s6-na-gss-dev-cebos-qms-sa@prj-na-gss-supp-perform-d-219.iam.gserviceaccount.com" \
+     --role="roles/compute.networkUser"
+   ```
 
-3. **`cloudsql.iam_authentication` not set — fix directly, no admin
-   dependency.** This is self-service in the Cloud SQL console: open
-   `spms-db-dev` → **Edit** → **Flags and parameters** → **Add a database
-   flag** → select `cloudsql.iam_authentication` → set it **On** → **Save**.
-   The console will warn this restarts the instance — expected, it can't be
-   hot-patched (same via `gcloud sql instances patch
-   --database-flags=cloudsql.iam_authentication=on`). Do this during a
-   window where a brief dev-instance restart is acceptable.
+3. **`cloudsql.iam_authentication` — resolved**, see §3.
 
-Once #2 is confirmed (or granted) and #3 is applied, the Cloud Run side of
-the attachment (`--network=svpc-na-sharedsvs-d`,
-`--subnet=subnet-ue4-sscrworkerpool-d-1`, `--vpc-egress=private-ranges-only`,
-plus the `DB_*` env vars from §3) has everything it needs to be configured.
+Once #2 is confirmed (or granted), the Cloud Run side of the attachment
+(`--network=svpc-na-sharedsvs-d`, `--subnet=subnet-ue4-sscrworkerpool-d-1`,
+`--vpc-egress=private-ranges-only`, plus the `DB_*` env vars from §3) has
+everything it needs to be configured.
