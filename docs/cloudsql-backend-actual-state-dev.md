@@ -113,7 +113,7 @@ confirms it:
 |---|---|---|
 | `subnet-ue4-sscomposer-d-1` | `10.67.22.0/26` | Cloud Composer |
 | `subnet-ue4-ssconnector-d-1` … `-16` | sixteen `/28`s under `10.67.20.0/24` | Serverless VPC Access connectors (legacy pattern — too small per-subnet for Direct VPC egress, which doesn't use this mechanism) |
-| `subnet-ue4-sscrworkerpool-d-1` | `10.67.23.64/26` | **Best guess for Cloud Run egress** — "cr" naming, and `/26` matches Google's own minimum-sizing guidance for Direct VPC egress |
+| `subnet-ue4-sscrworkerpool-d-1` | `10.67.23.64/26` | **Confirmed by GCP admins (2026-10-02) as the subnet for this backend's Direct VPC egress.** Originally a naming-based guess ("cr" + `/26` matching Google's sizing guidance) — now confirmed, not inferred. |
 | `subnet-ue4-ssgke-d-6`, `-7` | `/28`s | GKE |
 | `subnet-ue4-ssgkelb-d-1` | `10.67.24.0/22` | GKE load balancing |
 | `subnet-ue4-ssgkemain-d-1` | `10.67.19.0/24` | GKE main |
@@ -139,23 +139,43 @@ etc.) — same observation the original docs already made: it's a shared SA
 to this backend. Still just a flag, not something this document is trying
 to resolve.
 
-## 7. Open items — need network-admin input before touching the pipeline
+## 7. Open items and remediation
 
-1. **Which subnet in `svpc-na-sharedsvs-d` (us-east4) is designated for this
-   backend's Direct VPC egress?** `subnet-ue4-sscrworkerpool-d-1` is the
-   naming-based guess (§5) — get it confirmed rather than assumed.
-2. **Has `roles/compute.networkUser` been granted to
-   `s6-na-gss-dev-cebos-qms-sa@...` in the host project
-   `prj-na-netsharedsvs-d-295`**, either at the project level or on the
-   specific subnet from #1? Check once #1 is answered:
+1. **Subnet — resolved.** GCP admins confirmed (2026-10-02)
+   `subnet-ue4-sscrworkerpool-d-1` (`10.67.23.64/26`, us-east4) is the
+   subnet this backend's Direct VPC egress should use.
+
+2. **`compute.networkUser` on the backend SA in the host project —
+   unverified, check before escalating.** The grant found in §6 is only in
+   `prj-na-gss-supp-perform-d-219`; Shared VPC requires the grant to exist
+   in the host project (or on the specific subnet) instead. Check first,
+   now that the subnet is known:
    ```bash
-   gcloud compute networks subnets get-iam-policy <SUBNET_NAME> \
+   gcloud compute networks subnets get-iam-policy subnet-ue4-sscrworkerpool-d-1 \
      --project=prj-na-netsharedsvs-d-295 --region=us-east4
    ```
-3. **Why is `cloudsql.iam_authentication` not set** despite the IAM DB user
-   already existing (§3) — oversight to fix, or did the auth plan change?
+   - Already lists `s6-na-gss-dev-cebos-qms-sa@prj-na-gss-supp-perform-d-219.iam.gserviceaccount.com`
+     with `roles/compute.networkUser` → done, nothing to request.
+   - Missing, or the command is denied → request from whoever administers
+     `prj-na-netsharedsvs-d-295`:
+     ```bash
+     gcloud compute networks subnets add-iam-policy-binding subnet-ue4-sscrworkerpool-d-1 \
+       --project=prj-na-netsharedsvs-d-295 \
+       --region=us-east4 \
+       --member="serviceAccount:s6-na-gss-dev-cebos-qms-sa@prj-na-gss-supp-perform-d-219.iam.gserviceaccount.com" \
+       --role="roles/compute.networkUser"
+     ```
 
-Until these three are answered, the Cloud Run side of the attachment
-(`--network`/`--subnet`/`--vpc-egress` flags) can't be filled in correctly —
-guessing the subnet risks attaching to the wrong one (e.g. a GKE- or
-connector-reserved range) with no clear failure until deploy time.
+3. **`cloudsql.iam_authentication` not set — fix directly, no admin
+   dependency.** This is self-service in the Cloud SQL console: open
+   `spms-db-dev` → **Edit** → **Flags and parameters** → **Add a database
+   flag** → select `cloudsql.iam_authentication` → set it **On** → **Save**.
+   The console will warn this restarts the instance — expected, it can't be
+   hot-patched (same via `gcloud sql instances patch
+   --database-flags=cloudsql.iam_authentication=on`). Do this during a
+   window where a brief dev-instance restart is acceptable.
+
+Once #2 is confirmed (or granted) and #3 is applied, the Cloud Run side of
+the attachment (`--network=svpc-na-sharedsvs-d`,
+`--subnet=subnet-ue4-sscrworkerpool-d-1`, `--vpc-egress=private-ranges-only`,
+plus the `DB_*` env vars from §3) has everything it needs to be configured.
