@@ -142,21 +142,17 @@ to resolve.
    `subnet-ue4-sscrworkerpool-d-1` (`10.67.23.64/26`, us-east4) is the
    subnet this backend's Direct VPC egress should use.
 
-2. **`compute.networkUser` on the backend SA in the host project — still
-   open, self-check attempted and blocked.** The grant found in §6 is only
-   in `prj-na-gss-supp-perform-d-219`; Shared VPC requires the grant to
-   exist in the host project (or on the specific subnet) instead. Tried to
-   check directly:
-   ```bash
-   gcloud compute networks subnets get-iam-policy subnet-ue4-sscrworkerpool-d-1 \
-     --project=prj-na-netsharedsvs-d-295 --region=us-east4
-   ```
-   Result: `HTTPError 403: Required 'compute.subnetworks.getIamPolicy'
-   permission` — this is about the calling user's own lack of read access
-   to that resource, not evidence either way about whether the backend SA
-   has the role. Since self-verification is blocked, this goes to the
-   network admins as one combined ask (confirm-or-grant, not two
-   round-trips):
+2. **`compute.networkUser` on the backend SA in the host project — open,
+   escalation confirmed necessary (not premature).** The grant found in §6
+   is only in `prj-na-gss-supp-perform-d-219`; Shared VPC requires the
+   grant to exist in the host project (or on the specific subnet) instead.
+   Checked via both interfaces before escalating:
+   - `gcloud compute networks subnets get-iam-policy subnet-ue4-sscrworkerpool-d-1 --project=prj-na-netsharedsvs-d-295 --region=us-east4` → `HTTPError 403: Required 'compute.subnetworks.getIamPolicy' permission`
+   - Console, switched project selector to `prj-na-netsharedsvs-d-295` directly → denied on `resourcemanager.projects.getIamPolicy` for the host project itself
+
+   Zero IAM visibility into the host project from either interface —
+   confirmed, not assumed. Sent as one combined ask (confirm-or-grant, not
+   two round-trips) to the network admins:
    > Can you check whether
    > `s6-na-gss-dev-cebos-qms-sa@prj-na-gss-supp-perform-d-219.iam.gserviceaccount.com`
    > has `roles/compute.networkUser` on subnet
