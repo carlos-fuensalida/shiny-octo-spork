@@ -89,16 +89,27 @@ now showing `cloudsql.iam_authentication: on` under Database flags and
 parameters on the instance's Overview page. The IAM-auth user in §3 can now
 actually authenticate.
 
-## 4. Cloud Run backend service — confirmed
+## 4. Cloud Run backend service(s) — confirmed
 
-| Field | Value |
-|---|---|
-| Service | `supp-perf-mgmt-backend`, region `us-east4` |
-| Runtime SA | `s6-na-gss-dev-cebos-qms-sa@prj-na-gss-supp-perform-d-219.iam.gserviceaccount.com` |
-| Current revision | `supp-perf-mgmt-backend-00015-5nh` |
-| Ingress | `all` (expected — this is the external path IAP's load balancer uses, not a contradiction of the IAP decision) |
-| VPC egress | **Not configured.** No `run.googleapis.com/vpc-access-connector` or network-interfaces annotation present on the revision — confirms Direct VPC egress hasn't been wired up yet, consistent with everything above. |
-| Existing env vars | `NODE_ENV`, `SERVICE_BASE_URL` (already a real URL, not the `placeholder.invalid` workaround — that's been resolved for this revision), `BIGQUERY_PROJECT_ID`/`BIGQUERY_DATASET_ID`/cost-recovery and VMI BigQuery vars. **No `DB_*` vars yet** — expected, nothing wires Postgres in yet. |
+**There are two backend Cloud Run services in this project**, both found
+while doing this work — not a naming inconsistency, two distinct services:
+
+| Field | `supp-perf-mgmt-backend` | `supp-perf-mgmt-backend-dev` |
+|---|---|---|
+| Label `env` | `uat` | `dev` |
+| Created | 2026-09-23 | 2026-09-16 |
+| Current revision | `supp-perf-mgmt-backend-00015-5nh` | `supp-perf-mgmt-backend-dev-00087-wmc` |
+| Runtime SA | `s6-na-gss-dev-cebos-qms-sa@prj-na-gss-supp-perform-d-219.iam.gserviceaccount.com` | same |
+| Ingress | `all` (expected — IAP's load balancer path, not a contradiction of the IAP decision) | same |
+| VPC egress | **Not configured** — no `vpc-access-connector`/network-interfaces annotation | same — not configured either |
+| Existing env vars | `NODE_ENV`, `SERVICE_BASE_URL` (real URL, not the `placeholder.invalid` workaround), `BIGQUERY_*` set. **No `DB_*` vars.** | same pattern, **no `DB_*` vars** |
+
+Both share the identical runtime SA and project, so every IAM/SQL/network
+finding in this document (§1–§3, §6) applies equally to either one — none
+of it is specific to one service over the other. **`supp-perf-mgmt-backend-dev`
+is the one actually being wired up to Cloud SQL** (confirmed 2026-10-03,
+console Networking tab) — treat that as the target for the remaining work,
+not `supp-perf-mgmt-backend`.
 
 ## 5. Shared VPC subnets available in `svpc-na-sharedsvs-d` (us-east4 only)
 
