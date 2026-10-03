@@ -190,6 +190,27 @@ to resolve.
    project plus `compute.networkUser` scoped to just
    `subnet-ue4-sscrworkerpool-d-1`.)
 
+   **Confirmed still blocked by two separate test deploys (2026-10-03),**
+   via the console Networking tab on `supp-perf-mgmt-backend-dev`, done
+   deliberately to see the exact failure mode while the ticket is pending:
+   - Attempt 1 (subnet `subnet-ue4-sspsc-d-1`, wrong subnet — Cloud SQL's
+     own PSC subnet, not meant for Cloud Run) → failed at revision creation:
+     `Access to the subnetwork subnet-ue4-sspsc-d-1 is not allowed`
+   - Attempt 2 (subnet `subnet-ue4-sscrworkerpool-d-1`, the correct one
+     from #1 above) → **failed the same way**:
+     `Access to the subnetwork subnet-ue4-sscrworkerpool-d-1 is not allowed`
+
+   Both attempts failed cleanly at revision-creation time (the previous
+   working revision kept serving all traffic throughout — no outage from
+   testing this). The second result rules out "wrong subnet" as the cause —
+   it's the missing Service Agent grant, exactly as diagnosed. **Do not try
+   additional subnets** — `subnet-ue4-sscrworkerpool-d-1` remains correct;
+   Cloud Run's egress subnet doesn't need to match Cloud SQL's own PSC
+   subnet (`subnet-ue4-sspsc-d-1`, where the database's `10.67.18.2`
+   endpoint lives) — they just both need to sit inside the same VPC
+   (`svpc-na-sharedsvs-d`), which they do. Nothing further to try until the
+   ticket lands.
+
 3. **`cloudsql.iam_authentication` — resolved**, see §3.
 
 Once #2 is confirmed (or granted), the Cloud Run side of the attachment
