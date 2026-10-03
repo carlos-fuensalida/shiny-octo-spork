@@ -180,6 +180,15 @@ in place unless removing it is the task, but flag it.
   environment, why a smoke check has no `-f`, why a flag is `--no-allow-` vs
   `--allow-`. Match that density. This repo's value is largely the reasoning
   it captures, not the code.
+- **For anything involving GCP — IAM requirements, required roles/service
+  agents, flag names and syntax, product behavior — check
+  https://docs.cloud.google.com/ rather than answering from memory or
+  inferring from naming conventions.** GCP's required-identity and
+  permission rules are specific and change over time; a real case where this
+  mattered: the Direct VPC egress + Shared VPC `compute.networkUser` grant
+  needed to go on the Cloud Run Service Agent, not the runtime service
+  account — only caught by checking the docs before a ticket went out on the
+  wrong principal.
 - **`docs/bitbucket-pipelines.yml` is a reference copy, not live config, and
   it drifts.** Bitbucket only ever reads `bitbucket-pipelines.yml` at a
   repo's root — this file is a snapshot of the backend's real pipeline for
